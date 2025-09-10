@@ -61,7 +61,7 @@ LATEST_RELEASE_INFO=$(curl -s -L \
   -H "Accept: application/vnd.github+json" \
   -H "Authorization: Bearer $GITHUB_TOKEN" \
   "$API_URL")
-# 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
+
 # Extract the tarball URL using a simple, reliable grep
 TARBALL_URL=$(echo "$LATEST_RELEASE_INFO" | jq -r '.tarball_url')
 
