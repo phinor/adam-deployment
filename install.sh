@@ -117,7 +117,7 @@ CRON_JOB_EXISTS=$(crontab -u "$DEPLOY_USER" -l 2>/dev/null | grep -F "$DEPLOY_DI
 if [ -n "$CRON_JOB_EXISTS" ]; then
     info "Cron job already exists. Skipping."
 else
-    (crontab -u "$DEPLOY_USER" -l 2>/dev/null; echo "$CRON_COMMAND") | crontab -u "$DEPLOY_USER" -
+    (crontab -u "$DEPLOY_USER" -l 2>/dev/null || true; echo "$CRON_COMMAND") | crontab -u "$DEPLOY_USER" -
     success "Cron job created."
 fi
 
