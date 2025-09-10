@@ -7,6 +7,23 @@ SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
 
 if [ -f "${SCRIPT_DIR}/deploy.conf" ]; then
     source "${SCRIPT_DIR}/deploy.conf"
+
+    if [ -z "$GITHUB_REPO" ]; then
+        echo "Error: GITHUB_REPO is not set in deploy.conf." >&2
+        exit 1
+    fi
+    if [ -z "$TOKEN_PATH" ]; then
+        echo "Error: TOKEN_PATH is not set in deploy.conf." >&2
+        exit 1
+    fi
+    if [ -z "$KEEP_RELEASES" ]; then
+        echo "Warning: KEEP_RELEASES is not set in deploy.conf - assuming 5." >&2
+        KEEP_RELEASES=5
+    fi
+    if [ -z "$FPM_USER" ]; then
+        echo "Error: FPM_USER is not set in deploy.conf." >&2
+        exit 1
+    fi
 else
     echo "Error: Configuration file not found" >&2
     exit 1
@@ -44,12 +61,12 @@ LATEST_RELEASE_INFO=$(curl -s -L \
   -H "Accept: application/vnd.github+json" \
   -H "Authorization: Bearer $GITHUB_TOKEN" \
   "$API_URL")
-
+# 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
 # Extract the tarball URL using a simple, reliable grep
-TARBALL_URL=$(echo "$LATEST_RELEASE_INFO" | grep -o '"tarball_url":[ ]*"[^"]*"' | cut -d '"' -f 4)
+TARBALL_URL=$(echo "$LATEST_RELEASE_INFO" | jq -r '.tarball_url')
 
-if [ -z "$TARBALL_URL" ]; then
-    echo "Error: Could not find 'tarball_url' in the API response. Aborting."
+if [ -z "$TARBALL_URL" ] || [ "$TARBALL_URL" == "null" ]; then
+    echo "Error: Could not find 'tarball_url' using jq. Aborting."
     exit 1
 fi
 
@@ -86,18 +103,21 @@ else
     tar -xzf "/tmp/release.tar.gz" -C "$NEW_RELEASE_PATH" --strip-components=1
     rm "/tmp/release.tar.gz"
 
-    if [ -L "$LIVE_LINK" ] && [ -d "$(readlink -f $LIVE_LINK)" ]; then
+    RESOLVED_LIVE_PATH="$(readlink -f "$LIVE_LINK")"
+
+    # Check if the resolved path actually exists and is a directory
+    if [ -L "$LIVE_LINK" ] && [ -d "$RESOLVED_LIVE_PATH" ]; then
         echo "Copying .ini configuration files..."
-        find "$(readlink -f $LIVE_LINK)" -maxdepth 1 -name "*.ini" -exec cp {} "$NEW_RELEASE_PATH/" \;
+        find "$RESOLVED_LIVE_PATH" -maxdepth 1 -name "*.ini" -exec cp {} "$NEW_RELEASE_PATH/" \;
     fi
 
     echo "Running composer install..."
     # Try to run composer in the root. If it fails (due to the '||'), try it in the '3party' subdirectory.
     # If the second one also fails, the 'set -e' at the top of the script will cause the entire deployment to abort.
-    if (cd "$NEW_RELEASE_PATH" && composer install --no-dev --optimize-autoloader); then
+    if (cd "$NEW_RELEASE_PATH" && composer install --no-dev --optimize-autoloader --no-progress); then
         echo "Composer install successful in root directory."
     else
-        echo "Composer install failed in both root and '3party' directories. Aborting."
+        echo "Composer install failed. Aborting."
         exit 1
     fi
 fi
