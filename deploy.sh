@@ -7,9 +7,6 @@ SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
 
 if [ -f "${SCRIPT_DIR}/deploy.conf" ]; then
     source "${SCRIPT_DIR}/deploy.conf"
-elif [ -f "${SCRIPT_DIR}/deploy.dist.conf" ]; then
-    echo "Loading default configuration. Consider adding your own..."
-    source "${SCRIPT_DIR}/deploy.dist.conf"
 else
     echo "Error: Configuration file not found" >&2
     exit 1
