@@ -62,7 +62,6 @@ LATEST_RELEASE_INFO=$(curl -s -L \
   -H "Authorization: Bearer $GITHUB_TOKEN" \
   "$API_URL")
 
-# Extract the tarball URL using a simple, reliable grep
 TARBALL_URL=$(echo "$LATEST_RELEASE_INFO" | jq -r '.tarball_url')
 
 if [ -z "$TARBALL_URL" ] || [ "$TARBALL_URL" == "null" ]; then
@@ -71,7 +70,6 @@ if [ -z "$TARBALL_URL" ] || [ "$TARBALL_URL" == "null" ]; then
 fi
 
 # --- 4. Extract Hash and Compare Versions ---
-# The hash is the last part of the URL path. 'basename' extracts it cleanly.
 LATEST_HASH=$(basename "$TARBALL_URL")
 
 CURRENT_HASH=""
@@ -90,36 +88,55 @@ NEW_RELEASE_PATH="$RELEASES_DIR/$LATEST_HASH"
 if [ -d "$NEW_RELEASE_PATH" ]; then
     echo "Release directory for $LATEST_HASH already exists. Re-using."
 else
-    echo "New release detected. Downloading and building..."
-    mkdir -p "$NEW_RELEASE_PATH"
+    # --- MODIFICATION START ---
+    # Create a temporary directory for the build process.
+    TMP_RELEASE_PATH="$RELEASES_DIR/tmp-$LATEST_HASH-$(date +%s)"
+    mkdir -p "$TMP_RELEASE_PATH"
+
+    # Set a trap: If the script exits for any reason, clean up the temp directory.
+    trap "echo 'Deployment failed. Cleaning up temporary directory...'; rm -rf '$TMP_RELEASE_PATH'; exit 1" EXIT SIGHUP SIGINT SIGTERM
+
+    echo "New release detected. Building in temporary directory: $TMP_RELEASE_PATH"
 
     echo "Downloading release archive from $TARBALL_URL"
-    # GitHub's tarball URL requires the -L flag to follow redirects
-    curl -s -L -o "/tmp/release.tar.gz" \
+    # Added --fail to curl to exit with an error on HTTP failures (like 404).
+    curl -s -L --fail -o "/tmp/release.tar.gz" \
       -H "Authorization: Bearer $GITHUB_TOKEN" \
       "$TARBALL_URL"
 
-    # The downloaded tarball has a top-level directory; we use --strip-components=1 to ignore it.
-    tar -xzf "/tmp/release.tar.gz" -C "$NEW_RELEASE_PATH" --strip-components=1
+    tar -xzf "/tmp/release.tar.gz" -C "$TMP_RELEASE_PATH" --strip-components=1
     rm "/tmp/release.tar.gz"
+
+    # Defense-in-depth: Check if the directory is empty after extraction.
+    if [ -z "$(ls -A "$TMP_RELEASE_PATH")" ]; then
+        echo "Error: The release directory is empty after extraction. Aborting."
+        # The trap will handle cleanup and exit.
+        exit 1
+    fi
 
     RESOLVED_LIVE_PATH="$(readlink -f "$LIVE_LINK")"
 
-    # Check if the resolved path actually exists and is a directory
     if [ -L "$LIVE_LINK" ] && [ -d "$RESOLVED_LIVE_PATH" ]; then
         echo "Copying .ini configuration files..."
-        find "$RESOLVED_LIVE_PATH" -maxdepth 1 -name "*.ini" -exec cp {} "$NEW_RELEASE_PATH/" \;
+        find "$RESOLVED_LIVE_PATH" -maxdepth 1 -name "*.ini" -exec cp {} "$TMP_RELEASE_PATH/" \;
     fi
 
     echo "Running composer install..."
-    # Try to run composer in the root. If it fails (due to the '||'), try it in the '3party' subdirectory.
-    # If the second one also fails, the 'set -e' at the top of the script will cause the entire deployment to abort.
-    if (cd "$NEW_RELEASE_PATH" && composer install --no-dev --optimize-autoloader --no-progress); then
-        echo "Composer install successful in root directory."
+    if (cd "$TMP_RELEASE_PATH" && composer install --no-dev --optimize-autoloader --no-progress); then
+        echo "Composer install successful."
     else
         echo "Composer install failed. Aborting."
+        # The trap will handle cleanup and exit.
         exit 1
     fi
+
+    # All steps successful, now perform the atomic move.
+    echo "Build successful. Moving to final destination."
+    mv "$TMP_RELEASE_PATH" "$NEW_RELEASE_PATH"
+
+    # Disable the trap since we have succeeded.
+    trap - EXIT SIGHUP SIGINT SIGTERM
+    # --- MODIFICATION END ---
 fi
 
 # --- 6. Activate the New Release ---
@@ -129,7 +146,6 @@ echo "$LATEST_HASH" > "$CURRENT_VERSION_FILE"
 echo "$LATEST_HASH" > "$NEW_RELEASE_PATH/includes/current.txt"
 
 # --- 7. Reset opcache ---
-# Reset PHP OPcache by calling the secret file through the web server
 echo "Resetting PHP OPcache for the web server..."
 sudo -u "$FPM_USER" /usr/local/bin/reset_opcache.sh
 
