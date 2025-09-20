@@ -65,7 +65,7 @@ API_URL="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
 echo "Fetching latest release info from GitHub..."
 LATEST_RELEASE_INFO=$(curl -s -L \
   -H "Accept: application/vnd.github+json" \
-  -H "Authorization: Bearer $GITHUB_TOKEN" \
+  -H "Authorization: Bearer $(cat "$TOKEN_PATH")" \
   "$API_URL")
 
 TARBALL_URL=$(echo "$LATEST_RELEASE_INFO" | jq -r '.tarball_url')
@@ -99,14 +99,14 @@ else
     mkdir -p "$TMP_RELEASE_PATH"
 
     # Set a trap: If the script exits for any reason, clean up the temp directory.
-    trap "echo 'Deployment failed. Cleaning up temporary directory...'; rm -rf '$TMP_RELEASE_PATH'; exit 1" EXIT SIGHUP SIGINT SIGTERM
+    trap 'echo "Deployment failed. Cleaning up temporary directory..."; rm -rf "$TMP_RELEASE_PATH"; exit 1' EXIT SIGHUP SIGINT SIGTERM
 
     echo "New release detected. Building in temporary directory: $TMP_RELEASE_PATH"
 
     echo "Downloading release archive from $TARBALL_URL"
     TMP_ARCHIVE=$(mktemp /tmp/release.XXXXXX.tar.gz)
-    trap "rm -f '$TMP_ARCHIVE'" EXIT
-    
+    trap 'rm -f "$TMP_ARCHIVE"' EXIT
+
     # Added --fail to curl to exit with an error on HTTP failures (like 404).
     curl -s -L --fail -o "$TMP_ARCHIVE" \
       -H "Authorization: Bearer $(cat "$TOKEN_PATH")" \
@@ -166,6 +166,6 @@ echo "--- Deployment check finished ---"
 # Pipe both stdout and stderr (2>&1) to the while loop.
 } 2>&1 | while IFS= read -r line; do
     # The 'date' format +%Y%m%d-%H%M%S is the shell equivalent of PHP's "Ymd-His"
-    printf '[%s] %s\n' "$(date '+%Y%m%d-%H%M%S')" "$line"
+    printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$line"
 done
 # --- MODIFICATION END ---
