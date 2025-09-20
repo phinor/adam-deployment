@@ -111,7 +111,7 @@ success "Log file and rotation configured."
 
 # --- 5. Schedule the Cron Job ---
 info "Scheduling the cron job for user '$DEPLOY_USER'..."
-CRON_COMMAND="*/5 * * * * sleep 30; $DEPLOY_DIR/deploy.sh >> /var/log/deployment.log 2>&1"
+CRON_COMMAND="*/5 * * * * $DEPLOY_DIR/deploy.sh >> /var/log/deployment.log 2>&1"
 CRON_JOB_EXISTS=$(crontab -u "$DEPLOY_USER" -l 2>/dev/null | grep -F "$DEPLOY_DIR/deploy.sh" | grep -v '^\s*#' || true)
 
 if [ -n "$CRON_JOB_EXISTS" ]; then
