@@ -15,8 +15,9 @@ one update specifically undoes something done in a previous update which might h
 4. Manually run `deploy.sh` from the installation folder, or wait for the installed `cron` script to run.
 5. Verify that a release folder has been created and that a `live` symbolic link exists within the deployment folder.
 6. Copy all `*.ini` files from existing installation to this release folder.
-7. Reconfigure site to point to the `live` folder and reload apache settings `sudo service apache2 reload`
-8. Verify site still works.
+7. Reconfigure site to point to the `live` folder.
+8. Reset the opcache.
+9. Verify site still works.
 
 ## Maintenance
 
