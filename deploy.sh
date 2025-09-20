@@ -55,7 +55,6 @@ if [ ! -f "$TOKEN_PATH" ]; then
     echo "Authentication Error: GitHub token file not found at $TOKEN_PATH"
     exit 1
 fi
-GITHUB_TOKEN=$(cat "$TOKEN_PATH")
 
 echo "--- Starting deployment check at $(date) ---"
 mkdir -p "$RELEASES_DIR"
@@ -105,13 +104,16 @@ else
     echo "New release detected. Building in temporary directory: $TMP_RELEASE_PATH"
 
     echo "Downloading release archive from $TARBALL_URL"
+    TMP_ARCHIVE=$(mktemp /tmp/release.XXXXXX.tar.gz)
+    trap "rm -f '$TMP_ARCHIVE'" EXIT
+    
     # Added --fail to curl to exit with an error on HTTP failures (like 404).
-    curl -s -L --fail -o "/tmp/release.tar.gz" \
-      -H "Authorization: Bearer $GITHUB_TOKEN" \
+    curl -s -L --fail -o "$TMP_ARCHIVE" \
+      -H "Authorization: Bearer $(cat "$TOKEN_PATH")" \
       "$TARBALL_URL"
 
-    tar -xzf "/tmp/release.tar.gz" -C "$TMP_RELEASE_PATH" --strip-components=1
-    rm "/tmp/release.tar.gz"
+    tar -xzf "$TMP_ARCHIVE" -C "$TMP_RELEASE_PATH" --strip-components=1
+    rm "$TMP_ARCHIVE"
 
     # Defense-in-depth: Check if the directory is empty after extraction.
     if [ -z "$(ls -A "$TMP_RELEASE_PATH")" ]; then
