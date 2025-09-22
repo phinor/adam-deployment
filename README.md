@@ -8,16 +8,18 @@ one update specifically undoes something done in a previous update which might h
 
 ## Installation
 
-1. Copy the contents of this repository to a temporary folder on your server.
-2. Run the `install_composer.sh` command to install composer
-3. Run the `install.sh` command to set up the deployment script. Most defaults are fine to accept. Don't forget to paste
-   in a Github PAT.
-4. Manually run `deploy.sh` from the installation folder, or wait for the installed `cron` script to run.
-5. Verify that a release folder has been created and that a `live` symbolic link exists within the deployment folder.
-6. Copy all `*.ini` files from existing installation to this release folder.
-7. Reconfigure site to point to the `live` folder.
-8. Reset the opcache.
-9. Verify site still works.
+1. If the server currently hosts ADAM, make sure that it's web dir is not `/var/www/adam`. Move it if it is: `sudo mv /var/www/adam /var/www/adam-old`
+2. Get the local user's (this should not be a privileged user) public ssh key with `cat ~/.ssh/id*.pub`. If no SSH key,
+generate an SSH key with `ssh-keygen`. Rerun the `cat ~/.ssh/id*.pub` command once done.
+3. Add the public key to this repository's deploy keys: https://github.com/phinor/adam-deployment/settings/keys
+4. Run the following command while logged in as the deployment user: `cd ~ && git clone git@github.com:phinor/adam-deployment.git deploy`
+5. If ssh is blocked on the firewall, try this: `cd ~ && git clone https://github.com/phinor/adam-deployment.git deploy`
+7. Run `cd ~/deploy && sudo install.sh` command to set up the deployment script. Most defaults are fine to accept. Don't forget to paste
+   in a Github PAT. Generate the PAT here: https://github.com/settings/personal-access-tokens
+8. Wait for the installed `cron` script to run on */5.
+9. Verify that a release folder has been created and that a `live` symbolic link exists within the deployment folder.
+10. Copy all `*.ini` files from existing installation to this release folder.
+11. Verify site still works.
 
 ## Maintenance
 
