@@ -36,9 +36,6 @@ GITHUB_TOKEN=${REPLY}
 
 # --- 2. Place Scripts and Create Configuration ---
 info "Placing scripts and creating configuration..."
-mkdir -p "$DEPLOY_DIR"
-cp deploy.sh "$DEPLOY_DIR/"
-cp reset_opcache.sh "$DEPLOY_DIR/"
 cp deploy.dist.conf "$DEPLOY_DIR/deploy.conf"
 
 # Update the deploy.conf file with user-provided values
@@ -111,7 +108,7 @@ success "Log file and rotation configured."
 
 # --- 5. Schedule the Cron Job ---
 info "Scheduling the cron job for user '$DEPLOY_USER'..."
-CRON_COMMAND="*/5 * * * * $DEPLOY_DIR/deploy.sh >> /var/log/deployment.log 2>&1"
+CRON_COMMAND="*/5 * * * * cd $DEPLOY_DIR && git pull && ./deploy.sh >> /var/log/deployment.log 2>&1"
 CRON_JOB_EXISTS=$(crontab -u "$DEPLOY_USER" -l 2>/dev/null | grep -F "$DEPLOY_DIR/deploy.sh" | grep -v '^\s*#' || true)
 
 if [ -n "$CRON_JOB_EXISTS" ]; then
