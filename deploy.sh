@@ -25,21 +25,20 @@ if [ -f "${SCRIPT_DIR}/deploy.conf" ]; then
         exit 1
     fi
 else
-    echo "Error: Configuration file not found" >&2
+    echo "Error: Configuration file not found at ${SCRIPT_DIR}/deploy.conf" >&2
     exit 1
 fi
 
-# --- MODIFICATION START ---
 # Set 'e' to exit on error and 'o pipefail' to ensure a pipeline's exit code
 # is the status of the last command to exit with a non-zero status.
 set -eo pipefail
 
 # Wrap the entire execution in a block to pipe its output
 {
-# --- MODIFICATION END ---
 
 # --- Derived Variables ---
 RELEASES_DIR="$APP_BASE_DIR/releases"
+OVERRIDE_DIR="$APP_BASE_DIR/override"
 LIVE_LINK="$APP_BASE_DIR/live"
 CURRENT_VERSION_FILE="$APP_BASE_DIR/current.txt"
 LOCK_FILE="$APP_BASE_DIR/deploy.lock"
@@ -64,9 +63,9 @@ API_URL="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
 
 echo "Fetching latest release info from GitHub..."
 LATEST_RELEASE_INFO=$(curl -s -L \
-  -H "Accept: application/vnd.github+json" \
-  -H "Authorization: Bearer $(cat "$TOKEN_PATH")" \
-  "$API_URL")
+    -H "Accept: application/vnd.github+json" \
+    -H "Authorization: Bearer $(cat "$TOKEN_PATH")" \
+    "$API_URL")
 
 TARBALL_URL=$(echo "$LATEST_RELEASE_INFO" | jq -r '.tarball_url')
 
@@ -105,12 +104,14 @@ else
 
     echo "Downloading release archive from $TARBALL_URL"
     TMP_ARCHIVE=$(mktemp /tmp/release.XXXXXX.tar.gz)
-    trap 'rm -f "$TMP_ARCHIVE"' EXIT
+    # Add the new temp archive to the trap
+    trap 'echo "Deployment failed. Cleaning up..."; rm -rf "$TMP_RELEASE_PATH"; rm -f "$TMP_ARCHIVE"; exit 1' EXIT SIGHUP SIGINT SIGTERM
+
 
     # Added --fail to curl to exit with an error on HTTP failures (like 404).
     curl -s -L --fail -o "$TMP_ARCHIVE" \
-      -H "Authorization: Bearer $(cat "$TOKEN_PATH")" \
-      "$TARBALL_URL"
+        -H "Authorization: Bearer $(cat "$TOKEN_PATH")" \
+        "$TARBALL_URL"
 
     tar -xzf "$TMP_ARCHIVE" -C "$TMP_RELEASE_PATH" --strip-components=1
     rm "$TMP_ARCHIVE"
@@ -144,6 +145,19 @@ else
     trap - EXIT SIGHUP SIGINT SIGTERM
 fi
 
+# --- 5b. Apply Site-Specific Overrides ---
+if [ -d "$OVERRIDE_DIR" ] && [ -n "$(ls -A "$OVERRIDE_DIR")" ]; then
+    echo "Override directory found with content. Applying site-specific overrides from $OVERRIDE_DIR..."
+    # Use 'cp -a' to preserve permissions, symlinks, etc.
+    # The '/.' copies the *contents* of the override dir (including hidden files)
+    # into the new release path, overwriting as needed.
+    # 'set -e' will catch any errors here and halt the script.
+    cp -a "$OVERRIDE_DIR/." "$NEW_RELEASE_PATH/"
+    echo "Overrides applied successfully."
+else
+    echo "No override directory found at $OVERRIDE_DIR (or directory is empty). Skipping override step."
+fi
+
 # --- 6. Activate the New Release ---
 echo "Activating release: $LATEST_HASH"
 ln -sfn "$NEW_RELEASE_PATH" "$LIVE_LINK"
@@ -161,11 +175,9 @@ ls -1dt "$RELEASES_DIR"/* | tail -n +$(($KEEP_RELEASES + 1)) | xargs -r rm -rf
 echo "Deployment of version $LATEST_HASH successful!"
 echo "--- Deployment check finished ---"
 
-# --- MODIFICATION START ---
 # End of the execution block.
 # Pipe both stdout and stderr (2>&1) to the while loop.
 } 2>&1 | while IFS= read -r line; do
     # The 'date' format +%Y%m%d-%H%M%S is the shell equivalent of PHP's "Ymd-His"
     printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$line"
 done
-# --- MODIFICATION END ---
