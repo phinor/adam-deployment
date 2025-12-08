@@ -3,6 +3,13 @@ set -e  # Exit immediately if a command exits with a non-zero status.
 set -u  # Treat unset variables as an error.
 set -o pipefail # Return value of a pipeline is the status of the last command to exit with a non-zero status.
 
+# --- ROOT PRIVILEGE CHECK ---
+if [[ $EUID -ne 0 ]]; then
+   echo "This script must be run as root."
+   echo "Please run it using: sudo $0"
+   exit 1
+fi
+
 # --- Configuration & Constants ---
 BASE_WEB_DIR="/var/webdata"
 BASE_APP_DIR="/var/www/adam/live"
@@ -37,6 +44,7 @@ test_mysql_connection() {
     local pass=$3
     local db=$4
     
+    # Suppress output, we only care about success/failure code
     if mysql -h "$host" -u "$user" -p"$pass" "$db" -e "quit" 2>/dev/null; then
         return 0
     else
@@ -48,7 +56,7 @@ test_mysql_connection() {
 
 clear
 echo "=================================================="
-echo "   ADAM Setup Script: Safe & Robust Edition       "
+echo "   ADAM Setup Script: Robust & Secure             "
 echo "=================================================="
 echo
 
@@ -92,7 +100,7 @@ db_name="adam_$school"
 db_user="adam_$school"
 
 if [[ "$db_type" == "remote" ]]; then
-    # --- REMOTE PATH (MANUAL) ---
+    # --- REMOTE PATH (MANUAL VERIFICATION) ---
     read -p "Enter Remote DB Hostname/IP: " db_host
     
     detected_ip=$(hostname -I | awk '{print $1}')
@@ -128,7 +136,7 @@ if [[ "$db_type" == "remote" ]]; then
     done
 
 else
-    # --- LOCAL PATH ---
+    # --- LOCAL PATH (AUTOMATED) ---
     db_host="127.0.0.1"
     echo -n "Enter Local DB Root Password (leave blank if none): "
     read -s db_admin_pass
@@ -147,14 +155,14 @@ else
     if [[ -n "$db_admin_pass" ]]; then
         MYSQL_PWD="$db_admin_pass" mysql -u root -e "$SQL_COMMANDS"
     else
-        sudo mysql -u root -e "$SQL_COMMANDS"
+        mysql -u root -e "$SQL_COMMANDS"
     fi
     log "Local database created."
 fi
 
 # --- Step 4: File System Setup ---
 log "Creating directory structure..."
-# We already checked that the parent $school folder doesn't exist, so this is safe.
+# Note: No 'sudo' needed here because we confirmed root access at start
 mkdir -p "$BASE_WEB_DIR/adam/$school/"{pictures,backup,docrep,export/clever,export/google}
 mkdir -p "$BASE_WEB_DIR/temp/$school/updates"
 mkdir -p "$BASE_APP_DIR"
@@ -193,9 +201,9 @@ settings [ 3party_wkhtmltopdf_arg ] = --zoom 0.9877
 EOF
 
 # Move config safely
-sudo mv "$temp_config" "$BASE_APP_DIR/config.$domain.ini"
-sudo chown www-data:www-data "$BASE_APP_DIR/config.$domain.ini"
-sudo chmod 640 "$BASE_APP_DIR/config.$domain.ini"
+mv "$temp_config" "$BASE_APP_DIR/config.$domain.ini"
+chown www-data:www-data "$BASE_APP_DIR/config.$domain.ini"
+chmod 640 "$BASE_APP_DIR/config.$domain.ini"
 
 # --- Step 6: Cron Job Setup ---
 log "Updating Crontab..."
