@@ -5,7 +5,7 @@ set -o pipefail # Return value of a pipeline is the status of the last command t
 
 # --- Configuration & Constants ---
 BASE_WEB_DIR="/var/webdata"
-BASE_APP_DIR="/var/www/adam"
+BASE_APP_DIR="/var/www/adam/live"
 APACHE_AVAIL_DIR="/etc/apache2/sites-available"
 LOG_FILE="./adam_setup.log"
 
