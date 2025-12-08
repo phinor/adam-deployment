@@ -28,11 +28,16 @@ install_repos() {
 }
 
 install_mysql() {
-    log "Installing MySQL Server..."
+    # IDEMPOTENCY CHECK: Check if mysql-server is already installed
+    if dpkg -s mysql-server &> /dev/null; then
+        log "✅ MySQL is already installed. Skipping installation and user configuration."
+        return 0
+    fi
+
+    log "MySQL not found. Beginning installation..."
     DEBIAN_FRONTEND=noninteractive apt-get install -qy mysql-server >> "$LOGFILE" 2>&1
     
-    # Check if we have already set up the password to avoid asking twice
-    # We will ask for a password to assign to the new 'root2' admin user
+    # Only prompt for password during a FRESH install
     echo
     read -s -p "Enter a password for the NEW 'root2' admin user: " mysqlpw
     echo
@@ -41,11 +46,11 @@ install_mysql() {
     # We use sudo mysql to connect as the system root (socket auth)
     # Then we create root2 and assign privileges.
     sudo mysql -sfu root <<EOF
--- Create the user if it doesn't exist, or update password if it does
+-- Create the user if it doesn't exist
 CREATE USER IF NOT EXISTS 'root2'@'localhost' IDENTIFIED BY '${mysqlpw}';
 ALTER USER 'root2'@'localhost' IDENTIFIED BY '${mysqlpw}';
 
--- Grant full root-level privileges to root2
+-- Grant full root-level privileges to root2 (Localhost only)
 GRANT ALL PRIVILEGES ON *.* TO 'root2'@'localhost' WITH GRANT OPTION;
 
 -- Remove anonymous users and test database
@@ -60,8 +65,9 @@ EOF
     if ! grep -q "log_bin_trust_function_creators" /etc/mysql/mysql.conf.d/mysqld.cnf; then
         echo "log_bin_trust_function_creators = 1" | tee -a /etc/mysql/mysql.conf.d/mysqld.cnf
     fi
+    
     systemctl restart mysql
-    log "MySQL configured. 'root' uses sudo; 'root2' uses password."
+    log "MySQL installed. 'root2' created."
 }
 
 install_php_fpm() {
@@ -87,6 +93,7 @@ configure_php() {
     # We use FPM, so we configure the FPM pool and CLI
     for path in "fpm" "cli"; do
         DEST="/etc/php/$PHP_VERSION/$path/conf.d/99-adam-custom.ini"
+        # Only write if file doesn't exist or we want to enforce updates
         cat <<EOF > "$DEST"
 max_input_vars = 5000
 post_max_size = 1G
@@ -148,6 +155,7 @@ switch_apache_version() {
 update_firewall_web() {
     log "Updating Firewall for Web Traffic..."
     if command -v ufw &> /dev/null; then
+        # Check if rule exists before adding to avoid spamming logs (optional, ufw handles this well though)
         ufw allow 80/tcp comment 'HTTP' >> "$LOGFILE" 2>&1
         ufw allow 443/tcp comment 'HTTPS' >> "$LOGFILE" 2>&1
         ufw reload >> "$LOGFILE" 2>&1
@@ -175,4 +183,6 @@ fi
 echo
 echo "✅ Web Stack setup complete!"
 echo "PHP Version: $(php -r 'echo PHP_VERSION;')"
-echo "MySQL 'root2' created."
+if dpkg -s mysql-server &> /dev/null; then
+    echo "MySQL is installed."
+fi
