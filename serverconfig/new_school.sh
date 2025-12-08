@@ -208,7 +208,7 @@ chmod 640 "$BASE_APP_DIR/config.$domain.ini"
 # --- Step 6: Cron Job Setup ---
 log "Updating Crontab..."
 current_cron=$(crontab -l -u www-data 2>/dev/null || true)
-new_cron=$(echo "$current_cron" | grep -v "--config=$domain")
+new_cron=$(echo "$current_cron" | grep -v -e "--config=$domain")
 new_cron_entry="* * * * * php $BASE_APP_DIR/cron.php --config=$domain > /dev/null 2>&1"
 
 echo "$new_cron
