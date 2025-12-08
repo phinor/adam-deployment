@@ -49,14 +49,46 @@ else
     AVG_PHP_PROCESS_MB=$CALCULATED_PHP_AVG
 fi
 
+# --- Database Location Detection ---
+# Check /var/www/adam/live/config.*.ini for db_host
+CONFIG_DIR="/var/www/adam/live"
+USE_LOCAL_DB=true # Default to true for safety
+DETECTION_MSG="Default (Local DB)"
+
+if [ -d "$CONFIG_DIR" ]; then
+    # Check if there are any config files with db_host
+    if grep -r "db_host" "$CONFIG_DIR"/config.*.ini &>/dev/null; then
+        # Check if ANY config file points to localhost or 127.0.0.1
+        if grep -rE "db_host.*=.*(localhost|127\.0\.0\.1)" "$CONFIG_DIR"/config.*.ini &>/dev/null; then
+            USE_LOCAL_DB=true
+            DETECTION_MSG="Detected Local DB (found localhost in config)"
+        else
+            USE_LOCAL_DB=false
+            DETECTION_MSG="Detected Remote DB (no localhost in config)"
+        fi
+    fi
+fi
+
 # --- Calculations ---
-# MySQL (40% RAM)
-MYSQL_BUFFER_POOL_MB=$(echo "$TOTAL_RAM_MB * 0.40" | bc | cut -d. -f1)
+
+if [ "$USE_LOCAL_DB" = true ]; then
+    # Standard Split: 40% MySQL / 40% PHP
+    MYSQL_ALLOC_PCT=0.40
+    PHP_ALLOC_PCT=0.40
+    MYSQL_BUFFER_POOL_MB=$(echo "$TOTAL_RAM_MB * $MYSQL_ALLOC_PCT" | bc | cut -d. -f1)
+else
+    # Remote DB Split: 0% MySQL (Minimal) / 80% PHP
+    MYSQL_ALLOC_PCT=0.00
+    PHP_ALLOC_PCT=0.80
+    # Set MySQL to minimal 128MB safety floor if installed but unused
+    MYSQL_BUFFER_POOL_MB=128
+fi
+
 MYSQL_LOG_FILE_MB=512
 MYSQL_MAX_CONN=100
 
-# PHP (40% RAM)
-RAM_FOR_PHP_MB=$(echo "$TOTAL_RAM_MB * 0.40" | bc | cut -d. -f1)
+# PHP Calculation
+RAM_FOR_PHP_MB=$(echo "$TOTAL_RAM_MB * $PHP_ALLOC_PCT" | bc | cut -d. -f1)
 PHP_MAX_CHILDREN=$(echo "$RAM_FOR_PHP_MB / $AVG_PHP_PROCESS_MB" | bc)
 [ "$PHP_MAX_CHILDREN" -lt "5" ] && PHP_MAX_CHILDREN=5
 
@@ -98,11 +130,16 @@ if [ "$MODE" == "report" ]; then
     echo -e "${CYAN}--- LAMP Stack Tuning Report (Dry Run) ---${NC}"
     echo -e "Resources: ${YELLOW}${TOTAL_RAM_GB}GB RAM${NC} | ${YELLOW}${TOTAL_CPUS} CPU Cores${NC}"
     echo -e "PHP Avg Process: ${YELLOW}${AVG_PHP_PROCESS_MB} MB${NC} (Minimum enforced: 60MB)"
+    echo -e "DB Mode: ${YELLOW}${DETECTION_MSG}${NC}"
     echo ""
     echo -e "${GREEN}Proposed Settings:${NC}"
-    echo -e "  [MySQL]  innodb_buffer_pool_size = ${MYSQL_BUFFER_POOL_MB}M"
+    if [ "$USE_LOCAL_DB" = true ]; then
+        echo -e "  [MySQL]  innodb_buffer_pool_size = ${MYSQL_BUFFER_POOL_MB}M (40% Allocation)"
+    else
+        echo -e "  [MySQL]  innodb_buffer_pool_size = ${MYSQL_BUFFER_POOL_MB}M (Minimal Safety Floor)"
+    fi
     echo -e "  [MySQL]  innodb_log_file_size    = ${MYSQL_LOG_FILE_MB}M"
-    echo -e "  [PHP]    pm.max_children         = ${PHP_MAX_CHILDREN}"
+    echo -e "  [PHP]    pm.max_children         = ${PHP_MAX_CHILDREN} ($(echo "$PHP_ALLOC_PCT * 100" | bc | cut -d. -f1)% Allocation)"
     echo -e "  [Apache] MaxRequestWorkers       = ${APACHE_MAX_WORKERS}"
     echo ""
     echo -e "To apply these changes, run: ${YELLOW}sudo ./tune.sh apply${NC}"
@@ -114,6 +151,7 @@ fi
 # ==============================================================================
 if [ "$MODE" == "apply" ]; then
     echo -e "${CYAN}--- Applying Configuration Changes ---${NC}"
+    echo -e "Mode: ${YELLOW}${DETECTION_MSG}${NC}"
 
     # --- 1. MySQL ---
     echo -n "Configuring MySQL... "
