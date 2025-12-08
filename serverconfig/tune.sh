@@ -41,7 +41,13 @@ TOTAL_CPUS=$(nproc)
 
 # Detect PHP Memory Usage
 CALCULATED_PHP_AVG=$(ps -eo rss,cmd | grep "[p]hp-fpm" | awk '{sum+=$1} END {if (NR>0) print int(sum/NR/1024); else print 0}')
-if [ "$CALCULATED_PHP_AVG" -gt "0" ]; then AVG_PHP_PROCESS_MB=$CALCULATED_PHP_AVG; else AVG_PHP_PROCESS_MB=50; fi
+
+# Enforce a 60MB minimum, otherwise use the calculated average
+if [ "$CALCULATED_PHP_AVG" -lt "60" ]; then
+    AVG_PHP_PROCESS_MB=60
+else
+    AVG_PHP_PROCESS_MB=$CALCULATED_PHP_AVG
+fi
 
 # --- Calculations ---
 # MySQL (40% RAM)
@@ -91,7 +97,7 @@ MYSQL_OVERRIDE_FILE="/etc/mysql/conf.d/z-tuning-script.cnf"
 if [ "$MODE" == "report" ]; then
     echo -e "${CYAN}--- LAMP Stack Tuning Report (Dry Run) ---${NC}"
     echo -e "Resources: ${YELLOW}${TOTAL_RAM_GB}GB RAM${NC} | ${YELLOW}${TOTAL_CPUS} CPU Cores${NC}"
-    echo -e "PHP Avg Process: ${YELLOW}${AVG_PHP_PROCESS_MB} MB${NC}"
+    echo -e "PHP Avg Process: ${YELLOW}${AVG_PHP_PROCESS_MB} MB${NC} (Minimum enforced: 60MB)"
     echo ""
     echo -e "${GREEN}Proposed Settings:${NC}"
     echo -e "  [MySQL]  innodb_buffer_pool_size = ${MYSQL_BUFFER_POOL_MB}M"
