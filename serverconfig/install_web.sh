@@ -28,29 +28,40 @@ install_repos() {
 }
 
 install_mysql() {
-    # Only prompts and installs if MySQL isn't already running
-    if ! systemctl is-active --quiet mysql; then
-        log "Installing MySQL..."
-        read -s -p "Enter a NEW root password for MySQL: " mysqlpw
-        echo
-        DEBIAN_FRONTEND=noninteractive apt-get install -qy mysql-server >> "$LOGFILE" 2>&1
-        
-        log "Securing MySQL..."
-        mysql -sfu root <<EOF
-ALTER USER "root"@"localhost" IDENTIFIED BY "${mysqlpw}";
+    log "Installing MySQL Server..."
+    DEBIAN_FRONTEND=noninteractive apt-get install -qy mysql-server >> "$LOGFILE" 2>&1
+    
+    # Check if we have already set up the password to avoid asking twice
+    # We will ask for a password to assign to the new 'root2' admin user
+    echo
+    read -s -p "Enter a password for the NEW 'root2' admin user: " mysqlpw
+    echo
+    
+    log "Configuring MySQL Users..."
+    # We use sudo mysql to connect as the system root (socket auth)
+    # Then we create root2 and assign privileges.
+    sudo mysql -sfu root <<EOF
+-- Create the user if it doesn't exist, or update password if it does
+CREATE USER IF NOT EXISTS 'root2'@'localhost' IDENTIFIED BY '${mysqlpw}';
+ALTER USER 'root2'@'localhost' IDENTIFIED BY '${mysqlpw}';
+
+-- Grant full root-level privileges to root2
+GRANT ALL PRIVILEGES ON *.* TO 'root2'@'localhost' WITH GRANT OPTION;
+
+-- Remove anonymous users and test database
 DELETE FROM mysql.user WHERE User="";
-DELETE FROM mysql.user WHERE User="root" AND Host NOT IN ("localhost", "127.0.0.1", "::1");
 DROP DATABASE IF EXISTS test;
+DELETE FROM mysql.db WHERE Db="test" OR Db="test\\_%";
+
 FLUSH PRIVILEGES;
 EOF
-        # Allow stored funcs
-        if ! grep -q "log_bin_trust_function_creators" /etc/mysql/mysql.conf.d/mysqld.cnf; then
-            echo "log_bin_trust_function_creators = 1" | tee -a /etc/mysql/mysql.conf.d/mysqld.cnf
-        fi
-        systemctl restart mysql
-    else
-        log "MySQL is already running. Skipping setup."
+
+    # Allow stored functions (often needed for frameworks)
+    if ! grep -q "log_bin_trust_function_creators" /etc/mysql/mysql.conf.d/mysqld.cnf; then
+        echo "log_bin_trust_function_creators = 1" | tee -a /etc/mysql/mysql.conf.d/mysqld.cnf
     fi
+    systemctl restart mysql
+    log "MySQL configured. 'root' uses sudo; 'root2' uses password."
 }
 
 install_php_fpm() {
@@ -164,4 +175,4 @@ fi
 echo
 echo "✅ Web Stack setup complete!"
 echo "PHP Version: $(php -r 'echo PHP_VERSION;')"
-echo "MySQL and Apache are running."
+echo "MySQL 'root2' created."
