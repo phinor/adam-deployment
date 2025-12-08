@@ -37,7 +37,7 @@ log "Updating system packages..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qy >> "$LOGFILE" 2>&1
 apt-get upgrade -qy >> "$LOGFILE" 2>&1
-apt-get install -qy software-properties-common curl wget unzip p7zip-full nano fail2ban ufw >> "$LOGFILE" 2>&1
+apt-get install -qy software-properties-common curl wget unzip p7zip-full nano fail2ban ufw git >> "$LOGFILE" 2>&1
 
 # 3. Timezone
 log "Setting Timezone..."
