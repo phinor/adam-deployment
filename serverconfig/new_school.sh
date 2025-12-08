@@ -147,7 +147,7 @@ else
     if [[ -n "$db_admin_pass" ]]; then
         MYSQL_PWD="$db_admin_pass" mysql -u root -e "$SQL_COMMANDS"
     else
-        mysql -u root -e "$SQL_COMMANDS"
+        sudo mysql -u root -e "$SQL_COMMANDS"
     fi
     log "Local database created."
 fi
