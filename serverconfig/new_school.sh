@@ -10,6 +10,10 @@ if [[ $EUID -ne 0 ]]; then
    exit 1
 fi
 
+# --- DETERMINE REAL USER ---
+# If SUDO_USER is set, use it; otherwise fallback to current user (root)
+REAL_USER="${SUDO_USER:-$(whoami)}"
+
 # --- Configuration & Constants ---
 BASE_WEB_DIR="/var/webdata"
 BASE_APP_DIR="/var/www/adam/live"
@@ -35,7 +39,20 @@ error_exit() {
 }
 
 generate_password() {
-    openssl rand -base64 12 | tr -dc 'a-zA-Z0-9' | head -c 16
+    local pass
+    while true; do
+        # FIXED: Use raw bytes (openssl rand 500) instead of base64.
+        pass=$(LC_ALL=C openssl rand 500 | tr -dc 'a-zA-Z0-9!@^_-' | head -c 20)
+
+        # Verify compliance: Must have Upper, Lower, Digit, AND Symbol
+        if echo "$pass" | grep -q '[A-Z]' && \
+           echo "$pass" | grep -q '[a-z]' && \
+           echo "$pass" | grep -q '[0-9]' && \
+           echo "$pass" | grep -q '[!@^_-]'; then
+            echo "$pass"
+            break
+        fi
+    done
 }
 
 test_mysql_connection() {
@@ -44,7 +61,6 @@ test_mysql_connection() {
     local pass=$3
     local db=$4
     
-    # Suppress output, we only care about success/failure code
     if mysql -h "$host" -u "$user" -p"$pass" "$db" -e "quit" 2>/dev/null; then
         return 0
     else
@@ -100,7 +116,7 @@ db_name="adam_$school"
 db_user="adam_$school"
 
 if [[ "$db_type" == "remote" ]]; then
-    # --- REMOTE PATH (MANUAL VERIFICATION) ---
+    # --- REMOTE PATH ---
     read -p "Enter Remote DB Hostname/IP: " db_host
     
     detected_ip=$(hostname -I | awk '{print $1}')
@@ -136,7 +152,7 @@ if [[ "$db_type" == "remote" ]]; then
     done
 
 else
-    # --- LOCAL PATH (AUTOMATED) ---
+    # --- LOCAL PATH ---
     db_host="127.0.0.1"
     echo -n "Enter Local DB Root Password (leave blank if none): "
     read -s db_admin_pass
@@ -162,9 +178,7 @@ fi
 
 # --- Step 4: File System Setup ---
 log "Creating directory structure..."
-# Note: No 'sudo' needed here because we confirmed root access at start
-mkdir -p "$BASE_WEB_DIR/adam/$school/"{pictures,backup,docrep,export/clever,export/google}
-mkdir -p "$BASE_WEB_DIR/temp/$school/updates"
+mkdir -p "$BASE_WEB_DIR/adam/$school/"{pictures,backup,docrep}
 mkdir -p "$BASE_APP_DIR"
 
 log "Setting permissions..."
@@ -188,21 +202,20 @@ installdir = $BASE_APP_DIR/
 url = https://$domain/
 
 [settings]
-settings [ dir_pic ] = $BASE_WEB_DIR/adam/$school/pictures/
 settings [ dir_temp ] = $BASE_WEB_DIR/temp/$school/
-settings [ dir_update ] = $BASE_WEB_DIR/temp/$school/updates/
-settings [ gappssync_export_dir ] = $BASE_WEB_DIR/adam/$school/export/google/
-settings [ cleversync_export_dir ] = $BASE_WEB_DIR/adam/$school/export/clever/
 settings [ cron_backup_location ] = $BASE_WEB_DIR/adam/$school/backup/
 settings [ external_url ] = https://$domain/
 settings [ docrep_location ] = $BASE_WEB_DIR/adam/$school/docrep/
 settings [ 3party_wkhtmltopdf ] = /usr/local/bin/wkhtmltopdf.sh
-settings [ 3party_wkhtmltopdf_arg ] = --zoom 0.9877
+settings [ 3party_wkhtmltopdf_arg ] = --zoom 1.25
 EOF
 
 # Move config safely
 mv "$temp_config" "$BASE_APP_DIR/config.$domain.ini"
-chown www-data:www-data "$BASE_APP_DIR/config.$domain.ini"
+
+# UPDATED: Set Owner to the actual User ($SUDO_USER), but Group to www-data.
+# This ensures the user can edit it, and Apache can read it (via group permissions).
+chown "${REAL_USER}:www-data" "$BASE_APP_DIR/config.$domain.ini"
 chmod 640 "$BASE_APP_DIR/config.$domain.ini"
 
 # --- Step 6: Cron Job Setup ---
