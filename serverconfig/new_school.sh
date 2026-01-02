@@ -179,6 +179,7 @@ fi
 # --- Step 4: File System Setup ---
 log "Creating directory structure..."
 mkdir -p "$BASE_WEB_DIR/adam/$school/"{pictures,backup,docrep}
+mkdir -p "$BASE_WEB_DIR/temp/$school"
 mkdir -p "$BASE_APP_DIR"
 
 log "Setting permissions..."
