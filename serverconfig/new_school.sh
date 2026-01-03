@@ -217,7 +217,7 @@ mv "$temp_config" "$BASE_APP_DIR/config.$domain.ini"
 # UPDATED: Set Owner to the actual User ($SUDO_USER), but Group to www-data.
 # This ensures the user can edit it, and Apache can read it (via group permissions).
 chown "${REAL_USER}:www-data" "$BASE_APP_DIR/config.$domain.ini"
-chmod 640 "$BASE_APP_DIR/config.$domain.ini"
+chmod 644 "$BASE_APP_DIR/config.$domain.ini"
 
 # --- Step 6: Cron Job Setup ---
 log "Updating Crontab..."
