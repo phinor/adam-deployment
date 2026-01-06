@@ -14,7 +14,7 @@ generate an SSH key with `ssh-keygen`. Rerun the `cat ~/.ssh/id*.pub` command on
 3. Add the public key to this repository's deploy keys: https://github.com/phinor/adam-deployment/settings/keys
 4. Run the following command while logged in as the deployment user: `cd ~ && git clone git@github.com:phinor/adam-deployment.git deploy`
 5. If ssh is blocked on the firewall, try this: `cd ~ && git clone https://github.com/phinor/adam-deployment.git deploy`
-7. Run `cd ~/deploy && sudo install.sh` command to set up the deployment script. Most defaults are fine to accept. Don't forget to paste
+7. Run `cd ~/deploy && sudo ./install.sh` command to set up the deployment script. Most defaults are fine to accept. Don't forget to paste
    in a Github PAT. Generate the PAT here: https://github.com/settings/personal-access-tokens
 8. Wait for the installed `cron` script to run on */5.
 9. Verify that a release folder has been created and that a `live` symbolic link exists within the deployment folder.
