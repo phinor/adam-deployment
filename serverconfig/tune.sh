@@ -124,7 +124,37 @@ APACHE_MPM_FILE="/etc/apache2/mods-available/mpm_event.conf"
 MYSQL_OVERRIDE_FILE="/etc/mysql/conf.d/z-tuning-script.cnf"
 
 # ==============================================================================
-# 2. REPORT MODE
+# 2. CURRENT CONFIGURATION DETECTION
+# ==============================================================================
+# Helpers to prevent crash if file missing
+get_ini_val() {
+    [ -f "$2" ] && grep "^$1" "$2" | cut -d= -f2 | tr -d ' ;M' || echo "Default"
+}
+get_apache_val() {
+    [ -f "$2" ] && grep "$1" "$2" | awk '{print $2}' || echo "Default"
+}
+
+# MySQL Current
+if [ -f "$MYSQL_OVERRIDE_FILE" ]; then
+    CUR_MYSQL_BUF=$(get_ini_val "innodb_buffer_pool_size" "$MYSQL_OVERRIDE_FILE")
+    CUR_MYSQL_LOG=$(get_ini_val "innodb_log_file_size" "$MYSQL_OVERRIDE_FILE")
+else
+    CUR_MYSQL_BUF="Default"
+    CUR_MYSQL_LOG="Default"
+fi
+
+# PHP Current
+CUR_PHP_CHILDREN=$(get_ini_val "pm.max_children" "$PHP_POOL_FILE")
+CUR_PHP_START=$(get_ini_val "pm.start_servers" "$PHP_POOL_FILE")
+CUR_PHP_MIN=$(get_ini_val "pm.min_spare_servers" "$PHP_POOL_FILE")
+CUR_PHP_MAX=$(get_ini_val "pm.max_spare_servers" "$PHP_POOL_FILE")
+
+# Apache Current
+CUR_APACHE_WORKERS=$(get_apache_val "MaxRequestWorkers" "$APACHE_MPM_FILE")
+
+
+# ==============================================================================
+# 3. REPORT MODE
 # ==============================================================================
 if [ "$MODE" == "report" ]; then
     echo -e "${CYAN}--- LAMP Stack Tuning Report (Dry Run) ---${NC}"
@@ -132,22 +162,32 @@ if [ "$MODE" == "report" ]; then
     echo -e "PHP Avg Process: ${YELLOW}${AVG_PHP_PROCESS_MB} MB${NC} (Minimum enforced: 60MB)"
     echo -e "DB Mode: ${YELLOW}${DETECTION_MSG}${NC}"
     echo ""
-    echo -e "${GREEN}Proposed Settings:${NC}"
+    echo -e "${GREEN}Comparison (Current -> Proposed):${NC}"
+    
+    # MySQL Output
     if [ "$USE_LOCAL_DB" = true ]; then
-        echo -e "  [MySQL]  innodb_buffer_pool_size = ${MYSQL_BUFFER_POOL_MB}M (40% Allocation)"
+        echo -e "  [MySQL]  innodb_buffer_pool_size : ${YELLOW}${CUR_MYSQL_BUF}M${NC} -> ${GREEN}${MYSQL_BUFFER_POOL_MB}M${NC} (40% RAM)"
     else
-        echo -e "  [MySQL]  innodb_buffer_pool_size = ${MYSQL_BUFFER_POOL_MB}M (Minimal Safety Floor)"
+        echo -e "  [MySQL]  innodb_buffer_pool_size : ${YELLOW}${CUR_MYSQL_BUF}M${NC} -> ${GREEN}${MYSQL_BUFFER_POOL_MB}M${NC} (Safety Floor)"
     fi
-    echo -e "  [MySQL]  innodb_log_file_size    = ${MYSQL_LOG_FILE_MB}M"
-    echo -e "  [PHP]    pm.max_children         = ${PHP_MAX_CHILDREN} ($(echo "$PHP_ALLOC_PCT * 100" | bc | cut -d. -f1)% Allocation)"
-    echo -e "  [Apache] MaxRequestWorkers       = ${APACHE_MAX_WORKERS}"
+    echo -e "  [MySQL]  innodb_log_file_size    : ${YELLOW}${CUR_MYSQL_LOG}M${NC} -> ${GREEN}${MYSQL_LOG_FILE_MB}M${NC}"
+    
+    # PHP Output
+    echo -e "  [PHP]    pm.max_children         : ${YELLOW}${CUR_PHP_CHILDREN}${NC} -> ${GREEN}${PHP_MAX_CHILDREN}${NC}"
+    echo -e "  [PHP]    pm.start_servers        : ${YELLOW}${CUR_PHP_START}${NC} -> ${GREEN}${PHP_START_SERVERS}${NC}"
+    echo -e "  [PHP]    pm.min_spare_servers    : ${YELLOW}${CUR_PHP_MIN}${NC} -> ${GREEN}${PHP_MIN_SPARE}${NC}"
+    echo -e "  [PHP]    pm.max_spare_servers    : ${YELLOW}${CUR_PHP_MAX}${NC} -> ${GREEN}${PHP_MAX_SPARE}${NC}"
+
+    # Apache Output
+    echo -e "  [Apache] MaxRequestWorkers       : ${YELLOW}${CUR_APACHE_WORKERS}${NC} -> ${GREEN}${APACHE_MAX_WORKERS}${NC}"
+    
     echo ""
     echo -e "To apply these changes, run: ${YELLOW}sudo ./tune.sh apply${NC}"
     exit 0
 fi
 
 # ==============================================================================
-# 3. APPLY MODE
+# 4. APPLY MODE
 # ==============================================================================
 if [ "$MODE" == "apply" ]; then
     echo -e "${CYAN}--- Applying Configuration Changes ---${NC}"
@@ -172,9 +212,7 @@ EOF
             cp "$PHP_POOL_FILE" "${PHP_POOL_FILE}.original.bak"
         fi
 
-        # Use sed to replace lines. We use a temporary file to avoid partial writes.
-        # We look for the directive at the start of the line (ignoring whitespace)
-        # Note: This regex assumes standard config format.
+        # Use sed to replace lines.
         sed -i "s/^pm.max_children.*/pm.max_children = ${PHP_MAX_CHILDREN}/" "$PHP_POOL_FILE"
         sed -i "s/^pm.start_servers.*/pm.start_servers = ${PHP_START_SERVERS}/" "$PHP_POOL_FILE"
         sed -i "s/^pm.min_spare_servers.*/pm.min_spare_servers = ${PHP_MIN_SPARE}/" "$PHP_POOL_FILE"
@@ -207,7 +245,7 @@ EOF
         sed -i "s/MinSpareThreads.*/MinSpareThreads          25/" "$APACHE_MPM_FILE"
         sed -i "s/MaxSpareThreads.*/MaxSpareThreads          75/" "$APACHE_MPM_FILE"
         sed -i "s/ThreadsPerChild.*/ThreadsPerChild          ${APACHE_THREADS_CHILD}/" "$APACHE_MPM_FILE"
-        sed -i "s/MaxRequestWorkers.*/MaxRequestWorkers      ${APACHE_MAX_WORKERS}/" "$APACHE_MPM_FILE"
+        sed -i "s/MaxRequestWorkers.*/MaxRequestWorkers       ${APACHE_MAX_WORKERS}/" "$APACHE_MPM_FILE"
 
         echo -e "${GREEN}Done${NC}"
     else
@@ -227,7 +265,7 @@ EOF
 fi
 
 # ==============================================================================
-# 4. REVERT MODE
+# 5. REVERT MODE
 # ==============================================================================
 if [ "$MODE" == "revert" ]; then
     echo -e "${CYAN}--- Reverting to Original Configuration ---${NC}"
@@ -274,4 +312,3 @@ fi
 
 # Fallback for unknown commands
 echo "Usage: ./tune.sh [report|apply|revert]"
-exit 1
