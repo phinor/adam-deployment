@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# LAMP Stack Tuning Automator (Ubuntu Optimized)
+# LAMP Stack Tuning Automator (Stability Edition)
 #
 # Usage:
 #   ./tune.sh report   (Default: Just calculates and shows values)
@@ -21,7 +21,7 @@ if ! command -v bc &> /dev/null; then
     exit 1
 fi
 
-MODE=${1:-report} # Default to 'report' mode if no argument given
+MODE=${1:-report} # Default to 'report' mode
 
 if [[ "$MODE" == "apply" || "$MODE" == "revert" ]]; then
     if [ "$EUID" -ne 0 ]; then
@@ -42,7 +42,7 @@ TOTAL_CPUS=$(nproc)
 # Detect PHP Memory Usage
 CALCULATED_PHP_AVG=$(ps -eo rss,cmd | grep "[p]hp-fpm" | awk '{sum+=$1} END {if (NR>0) print int(sum/NR/1024); else print 0}')
 
-# Enforce a 60MB minimum, otherwise use the calculated average
+# Enforce a 60MB minimum safety floor for calculations
 if [ "$CALCULATED_PHP_AVG" -lt "60" ]; then
     AVG_PHP_PROCESS_MB=60
 else
@@ -50,15 +50,12 @@ else
 fi
 
 # --- Database Location Detection ---
-# Check /var/www/adam/live/config.*.ini for db_host
 CONFIG_DIR="/var/www/adam/live"
-USE_LOCAL_DB=true # Default to true for safety
+USE_LOCAL_DB=true
 DETECTION_MSG="Default (Local DB)"
 
 if [ -d "$CONFIG_DIR" ]; then
-    # Check if there are any config files with db_host
     if grep -r "db_host" "$CONFIG_DIR"/config.*.ini &>/dev/null; then
-        # Check if ANY config file points to localhost or 127.0.0.1
         if grep -rE "db_host.*=.*(localhost|127\.0\.0\.1)" "$CONFIG_DIR"/config.*.ini &>/dev/null; then
             USE_LOCAL_DB=true
             DETECTION_MSG="Detected Local DB (found localhost in config)"
@@ -69,29 +66,38 @@ if [ -d "$CONFIG_DIR" ]; then
     fi
 fi
 
-# --- Calculations ---
+# --- Calculations (STABILITY TUNED) ---
 
 if [ "$USE_LOCAL_DB" = true ]; then
-    # Standard Split: 40% MySQL / 40% PHP
-    MYSQL_ALLOC_PCT=0.40
-    PHP_ALLOC_PCT=0.40
+    # Logic: If RAM < 8GB, be conservative (30% MySQL). If > 8GB, be aggressive (50%).
+    IS_LOW_RAM=$(echo "$TOTAL_RAM_GB < 8" | bc)
+    
+    if [ "$IS_LOW_RAM" -eq 1 ]; then
+        MYSQL_ALLOC_PCT=0.30
+        PHP_ALLOC_PCT=0.35
+    else
+        MYSQL_ALLOC_PCT=0.50
+        PHP_ALLOC_PCT=0.40
+    fi
+    
     MYSQL_BUFFER_POOL_MB=$(echo "$TOTAL_RAM_MB * $MYSQL_ALLOC_PCT" | bc | cut -d. -f1)
 else
-    # Remote DB Split: 0% MySQL (Minimal) / 80% PHP
+    # Remote DB
     MYSQL_ALLOC_PCT=0.00
     PHP_ALLOC_PCT=0.80
-    # Set MySQL to minimal 128MB safety floor if installed but unused
     MYSQL_BUFFER_POOL_MB=128
 fi
 
 MYSQL_LOG_FILE_MB=512
-MYSQL_MAX_CONN=100
+# UPDATED: Lowered from 100 to 60 to prevent OOM
+MYSQL_MAX_CONN=60 
 
 # PHP Calculation
 RAM_FOR_PHP_MB=$(echo "$TOTAL_RAM_MB * $PHP_ALLOC_PCT" | bc | cut -d. -f1)
 PHP_MAX_CHILDREN=$(echo "$RAM_FOR_PHP_MB / $AVG_PHP_PROCESS_MB" | bc)
-[ "$PHP_MAX_CHILDREN" -lt "5" ] && PHP_MAX_CHILDREN=5
 
+# Sanity checks for PHP
+[ "$PHP_MAX_CHILDREN" -lt "5" ] && PHP_MAX_CHILDREN=5
 PHP_START_SERVERS=$(echo "$PHP_MAX_CHILDREN / 4" | bc)
 PHP_MIN_SPARE=$(echo "$PHP_MAX_CHILDREN / 8" | bc)
 PHP_MAX_SPARE=$(echo "($PHP_MAX_CHILDREN / 3) + 1" | bc)
@@ -103,11 +109,12 @@ PHP_MEMORY_LIMIT="256M"
 PHP_OPCACHE_MEM=256
 
 # Apache
-APACHE_MAX_WORKERS=150
+# UPDATED: Lowered to 100 to match MySQL Connection Limit closer
+APACHE_MAX_WORKERS=100
 APACHE_THREADS_CHILD=25
 APACHE_MAX_CONN_CHILD=1000
 
-# --- File Path Detection (Ubuntu Specific) ---
+# --- File Path Detection ---
 PHP_FPM_SERVICE=$(systemctl list-units --type=service --state=running *php*fpm*.service | grep -o 'php[0-9]\.[0-9]-fpm\.service' | sort -V | tail -n 1)
 
 if [[ -n "$PHP_FPM_SERVICE" ]]; then
@@ -116,7 +123,6 @@ if [[ -n "$PHP_FPM_SERVICE" ]]; then
     PHP_INI_FILE="/etc/php/${PHP_VER}/fpm/php.ini"
     PHP_RESTART_CMD="systemctl restart php${PHP_VER}-fpm"
 else
-    # Fallback/Error if PHP not found, but we proceed for report mode
     PHP_VER="DETECT_FAILED"
 fi
 
@@ -124,63 +130,64 @@ APACHE_MPM_FILE="/etc/apache2/mods-available/mpm_event.conf"
 MYSQL_OVERRIDE_FILE="/etc/mysql/conf.d/z-tuning-script.cnf"
 
 # ==============================================================================
-# 2. CURRENT CONFIGURATION DETECTION
+# 2. SWAP CHECK FUNCTION
 # ==============================================================================
-# Helpers to prevent crash if file missing
-get_ini_val() {
-    [ -f "$2" ] && grep "^$1" "$2" | cut -d= -f2 | tr -d ' ;M' || echo "Default"
+ensure_swap() {
+    SWAP_SIZE=$(free -m | grep Swap | awk '{print $2}')
+    if [ "$SWAP_SIZE" -eq "0" ]; then
+        echo -e "${YELLOW}Warning: No Swap Detected!${NC}"
+        echo -n "Creating 4GB Swap file (The Airbag)... "
+        fallocate -l 4G /swapfile
+        chmod 600 /swapfile
+        mkswap /swapfile &>/dev/null
+        swapon /swapfile
+        
+        # Add to fstab if not present
+        if ! grep -q "/swapfile" /etc/fstab; then
+            echo '/swapfile none swap sw 0 0' >> /etc/fstab
+        fi
+        echo -e "${GREEN}Done${NC}"
+    else
+        echo -e "Swap Status: ${GREEN}OK${NC} (${SWAP_SIZE}MB detected)"
+    fi
 }
-get_apache_val() {
-    [ -f "$2" ] && grep "$1" "$2" | awk '{print $2}' || echo "Default"
-}
-
-# MySQL Current
-if [ -f "$MYSQL_OVERRIDE_FILE" ]; then
-    CUR_MYSQL_BUF=$(get_ini_val "innodb_buffer_pool_size" "$MYSQL_OVERRIDE_FILE")
-    CUR_MYSQL_LOG=$(get_ini_val "innodb_log_file_size" "$MYSQL_OVERRIDE_FILE")
-else
-    CUR_MYSQL_BUF="Default"
-    CUR_MYSQL_LOG="Default"
-fi
-
-# PHP Current
-CUR_PHP_CHILDREN=$(get_ini_val "pm.max_children" "$PHP_POOL_FILE")
-CUR_PHP_START=$(get_ini_val "pm.start_servers" "$PHP_POOL_FILE")
-CUR_PHP_MIN=$(get_ini_val "pm.min_spare_servers" "$PHP_POOL_FILE")
-CUR_PHP_MAX=$(get_ini_val "pm.max_spare_servers" "$PHP_POOL_FILE")
-
-# Apache Current
-CUR_APACHE_WORKERS=$(get_apache_val "MaxRequestWorkers" "$APACHE_MPM_FILE")
-
 
 # ==============================================================================
 # 3. REPORT MODE
 # ==============================================================================
-if [ "$MODE" == "report" ]; then
-    echo -e "${CYAN}--- LAMP Stack Tuning Report (Dry Run) ---${NC}"
-    echo -e "Resources: ${YELLOW}${TOTAL_RAM_GB}GB RAM${NC} | ${YELLOW}${TOTAL_CPUS} CPU Cores${NC}"
-    echo -e "PHP Avg Process: ${YELLOW}${AVG_PHP_PROCESS_MB} MB${NC} (Minimum enforced: 60MB)"
-    echo -e "DB Mode: ${YELLOW}${DETECTION_MSG}${NC}"
-    echo ""
-    echo -e "${GREEN}Comparison (Current -> Proposed):${NC}"
-    
-    # MySQL Output
-    if [ "$USE_LOCAL_DB" = true ]; then
-        echo -e "  [MySQL]  innodb_buffer_pool_size : ${YELLOW}${CUR_MYSQL_BUF}M${NC} -> ${GREEN}${MYSQL_BUFFER_POOL_MB}M${NC} (40% RAM)"
-    else
-        echo -e "  [MySQL]  innodb_buffer_pool_size : ${YELLOW}${CUR_MYSQL_BUF}M${NC} -> ${GREEN}${MYSQL_BUFFER_POOL_MB}M${NC} (Safety Floor)"
-    fi
-    echo -e "  [MySQL]  innodb_log_file_size    : ${YELLOW}${CUR_MYSQL_LOG}M${NC} -> ${GREEN}${MYSQL_LOG_FILE_MB}M${NC}"
-    
-    # PHP Output
-    echo -e "  [PHP]    pm.max_children         : ${YELLOW}${CUR_PHP_CHILDREN}${NC} -> ${GREEN}${PHP_MAX_CHILDREN}${NC}"
-    echo -e "  [PHP]    pm.start_servers        : ${YELLOW}${CUR_PHP_START}${NC} -> ${GREEN}${PHP_START_SERVERS}${NC}"
-    echo -e "  [PHP]    pm.min_spare_servers    : ${YELLOW}${CUR_PHP_MIN}${NC} -> ${GREEN}${PHP_MIN_SPARE}${NC}"
-    echo -e "  [PHP]    pm.max_spare_servers    : ${YELLOW}${CUR_PHP_MAX}${NC} -> ${GREEN}${PHP_MAX_SPARE}${NC}"
+# Helpers
+get_ini_val() { [ -f "$2" ] && grep "^$1" "$2" | cut -d= -f2 | tr -d ' ;M' || echo "Default"; }
+get_apache_val() { [ -f "$2" ] && grep "$1" "$2" | awk '{print $2}' || echo "Default"; }
 
-    # Apache Output
-    echo -e "  [Apache] MaxRequestWorkers       : ${YELLOW}${CUR_APACHE_WORKERS}${NC} -> ${GREEN}${APACHE_MAX_WORKERS}${NC}"
+if [ "$MODE" == "report" ]; then
+    # Current Values
+    if [ -f "$MYSQL_OVERRIDE_FILE" ]; then
+        CUR_MYSQL_BUF=$(get_ini_val "innodb_buffer_pool_size" "$MYSQL_OVERRIDE_FILE")
+    else
+        CUR_MYSQL_BUF="Default"
+    fi
+    CUR_PHP_CHILDREN=$(get_ini_val "pm.max_children" "$PHP_POOL_FILE")
+    CUR_APACHE_WORKERS=$(get_apache_val "MaxRequestWorkers" "$APACHE_MPM_FILE")
+
+    echo -e "${CYAN}--- LAMP Stack Tuning Report (Stability Edition) ---${NC}"
+    echo -e "Resources: ${YELLOW}${TOTAL_RAM_GB}GB RAM${NC} | ${YELLOW}${TOTAL_CPUS} CPU Cores${NC}"
     
+    # Swap Check for Report
+    SWAP_CHECK=$(free -m | grep Swap | awk '{print $2}')
+    if [ "$SWAP_CHECK" -eq "0" ]; then
+        echo -e "Swap:      ${RED}MISSING (Danger!)${NC} - Run 'apply' to fix."
+    else
+        echo -e "Swap:      ${GREEN}OK${NC} (${SWAP_CHECK}MB)"
+    fi
+
+    echo ""
+    echo -e "${GREEN}Proposed Changes for Stability:${NC}"
+
+    echo -e "  [MySQL]  innodb_buffer_pool_size : ${YELLOW}${CUR_MYSQL_BUF}M${NC} -> ${GREEN}${MYSQL_BUFFER_POOL_MB}M${NC} (30% RAM)"
+    echo -e "  [MySQL]  max_connections         : ${YELLOW}Unknown${NC} -> ${GREEN}${MYSQL_MAX_CONN}${NC}"
+    echo -e "  [PHP]    pm.max_children         : ${YELLOW}${CUR_PHP_CHILDREN}${NC} -> ${GREEN}${PHP_MAX_CHILDREN}${NC}"
+    echo -e "  [Apache] MaxRequestWorkers       : ${YELLOW}${CUR_APACHE_WORKERS}${NC} -> ${GREEN}${APACHE_MAX_WORKERS}${NC}"
+
     echo ""
     echo -e "To apply these changes, run: ${YELLOW}sudo ./tune.sh apply${NC}"
     exit 0
@@ -191,68 +198,62 @@ fi
 # ==============================================================================
 if [ "$MODE" == "apply" ]; then
     echo -e "${CYAN}--- Applying Configuration Changes ---${NC}"
-    echo -e "Mode: ${YELLOW}${DETECTION_MSG}${NC}"
+    
+    # 1. Swap
+    ensure_swap
 
-    # --- 1. MySQL ---
+    # 2. MySQL
     echo -n "Configuring MySQL... "
     cat > "$MYSQL_OVERRIDE_FILE" <<EOF
 [mysqld]
-# Auto-generated by tune.sh
+# Tuning Script - Stability Optimized
 innodb_buffer_pool_size = ${MYSQL_BUFFER_POOL_MB}M
 innodb_log_file_size = ${MYSQL_LOG_FILE_MB}M
 max_connections = ${MYSQL_MAX_CONN}
+# Disable heavy per-thread buffers to save RAM
+sort_buffer_size = 2M
+join_buffer_size = 2M
 EOF
-    echo -e "${GREEN}Done${NC} (Created $MYSQL_OVERRIDE_FILE)"
+    echo -e "${GREEN}Done${NC}"
 
-    # --- 2. PHP-FPM ---
+    # 3. PHP-FPM
     echo -n "Configuring PHP-FPM... "
     if [ -f "$PHP_POOL_FILE" ]; then
-        # Backup only if original backup doesn't exist
-        if [ ! -f "${PHP_POOL_FILE}.original.bak" ]; then
-            cp "$PHP_POOL_FILE" "${PHP_POOL_FILE}.original.bak"
-        fi
-
-        # Use sed to replace lines.
+        [ ! -f "${PHP_POOL_FILE}.original.bak" ] && cp "$PHP_POOL_FILE" "${PHP_POOL_FILE}.original.bak"
+        
         sed -i "s/^pm.max_children.*/pm.max_children = ${PHP_MAX_CHILDREN}/" "$PHP_POOL_FILE"
         sed -i "s/^pm.start_servers.*/pm.start_servers = ${PHP_START_SERVERS}/" "$PHP_POOL_FILE"
         sed -i "s/^pm.min_spare_servers.*/pm.min_spare_servers = ${PHP_MIN_SPARE}/" "$PHP_POOL_FILE"
         sed -i "s/^pm.max_spare_servers.*/pm.max_spare_servers = ${PHP_MAX_SPARE}/" "$PHP_POOL_FILE"
-        # Ensure mode is dynamic
         sed -i "s/^pm =.*/pm = dynamic/" "$PHP_POOL_FILE"
-
-        # PHP INI (OPCache)
-        if [ ! -f "${PHP_INI_FILE}.original.bak" ]; then
-            cp "$PHP_INI_FILE" "${PHP_INI_FILE}.original.bak"
-        fi
+        
+        # OPCache
+        [ ! -f "${PHP_INI_FILE}.original.bak" ] && cp "$PHP_INI_FILE" "${PHP_INI_FILE}.original.bak"
         sed -i "s/^;opcache.enable=.*/opcache.enable=1/" "$PHP_INI_FILE"
         sed -i "s/^opcache.enable=.*/opcache.enable=1/" "$PHP_INI_FILE"
-        sed -i "s/^;opcache.memory_consumption=.*/opcache.memory_consumption=${PHP_OPCACHE_MEM}/" "$PHP_INI_FILE"
         sed -i "s/^opcache.memory_consumption=.*/opcache.memory_consumption=${PHP_OPCACHE_MEM}/" "$PHP_INI_FILE"
-
+        
         echo -e "${GREEN}Done${NC}"
     else
-        echo -e "${RED}Failed${NC} (File $PHP_POOL_FILE not found)"
+        echo -e "${RED}Failed${NC} (File not found)"
     fi
 
-    # --- 3. Apache ---
+    # 4. Apache
     echo -n "Configuring Apache... "
     if [ -f "$APACHE_MPM_FILE" ]; then
-        if [ ! -f "${APACHE_MPM_FILE}.original.bak" ]; then
-            cp "$APACHE_MPM_FILE" "${APACHE_MPM_FILE}.original.bak"
-        fi
+        [ ! -f "${APACHE_MPM_FILE}.original.bak" ] && cp "$APACHE_MPM_FILE" "${APACHE_MPM_FILE}.original.bak"
 
         sed -i "s/StartServers.*/StartServers             3/" "$APACHE_MPM_FILE"
         sed -i "s/MinSpareThreads.*/MinSpareThreads          25/" "$APACHE_MPM_FILE"
         sed -i "s/MaxSpareThreads.*/MaxSpareThreads          75/" "$APACHE_MPM_FILE"
         sed -i "s/ThreadsPerChild.*/ThreadsPerChild          ${APACHE_THREADS_CHILD}/" "$APACHE_MPM_FILE"
         sed -i "s/MaxRequestWorkers.*/MaxRequestWorkers       ${APACHE_MAX_WORKERS}/" "$APACHE_MPM_FILE"
-
         echo -e "${GREEN}Done${NC}"
     else
-        echo -e "${RED}Skipped${NC} (Event MPM config not found at $APACHE_MPM_FILE)"
+        echo -e "${RED}Skipped${NC}"
     fi
 
-    # --- 4. Restart Services ---
+    # 5. Restart Services
     echo ""
     echo -e "${YELLOW}Restarting Services...${NC}"
     systemctl restart mysql && echo -e "MySQL: ${GREEN}OK${NC}" || echo -e "MySQL: ${RED}Failed${NC}"
@@ -268,47 +269,24 @@ fi
 # 5. REVERT MODE
 # ==============================================================================
 if [ "$MODE" == "revert" ]; then
-    echo -e "${CYAN}--- Reverting to Original Configuration ---${NC}"
-
-    # Remove MySQL Override
-    if [ -f "$MYSQL_OVERRIDE_FILE" ]; then
-        rm "$MYSQL_OVERRIDE_FILE"
-        echo -e "MySQL Override: ${GREEN}Removed${NC}"
-    else
-        echo -e "MySQL Override: ${YELLOW}Not found${NC}"
-    fi
-
-    # Restore PHP
+    echo -e "${CYAN}--- Reverting Configuration ---${NC}"
+    
+    [ -f "$MYSQL_OVERRIDE_FILE" ] && rm "$MYSQL_OVERRIDE_FILE"
+    
     if [ -f "${PHP_POOL_FILE}.original.bak" ]; then
         cp "${PHP_POOL_FILE}.original.bak" "$PHP_POOL_FILE"
-        echo -e "PHP-FPM Config: ${GREEN}Restored${NC}"
-    else
-        echo -e "PHP-FPM Backup: ${YELLOW}Not found${NC}"
     fi
-
     if [ -f "${PHP_INI_FILE}.original.bak" ]; then
         cp "${PHP_INI_FILE}.original.bak" "$PHP_INI_FILE"
-        echo -e "PHP INI Config: ${GREEN}Restored${NC}"
     fi
-
-    # Restore Apache
     if [ -f "${APACHE_MPM_FILE}.original.bak" ]; then
         cp "${APACHE_MPM_FILE}.original.bak" "$APACHE_MPM_FILE"
-        echo -e "Apache Config:  ${GREEN}Restored${NC}"
-    else
-        echo -e "Apache Backup:  ${YELLOW}Not found${NC}"
     fi
 
-    # Restart Services
-    echo ""
     echo -e "${YELLOW}Restarting Services...${NC}"
     systemctl restart mysql
     $PHP_RESTART_CMD
     systemctl restart apache2
-
     echo -e "${GREEN}Revert Complete!${NC}"
     exit 0
 fi
-
-# Fallback for unknown commands
-echo "Usage: ./tune.sh [report|apply|revert]"
