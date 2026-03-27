@@ -194,6 +194,15 @@ fi
     echo "Resetting PHP OPcache for the web server..."
     sudo -u "$FPM_USER" /usr/local/bin/reset_opcache.sh
 
+    # --- 7b. Restart queue workers for each tenant ---
+    echo "Restarting queue workers..."
+    for INI_FILE in "$NEW_RELEASE_PATH"/*.ini; do
+        [ -f "$INI_FILE" ] || continue
+        SCHOOL_NAME=$(basename "$INI_FILE" .ini)
+        echo "Restarting queue worker for: $SCHOOL_NAME"
+        php "$LIVE_LINK/adam" queue:restart --config="$SCHOOL_NAME"
+    done
+
     # --- 8. Clean up ---
     echo "Cleaning up old releases..."
     # $NEW_RELEASE_PATH was defined in Step 5 and is the full path
