@@ -80,7 +80,16 @@ if [ "$USE_LOCAL_DB" = true ]; then
         PHP_ALLOC_PCT=0.40
     fi
     
-    MYSQL_BUFFER_POOL_MB=$(echo "$TOTAL_RAM_MB * $MYSQL_ALLOC_PCT" | bc | cut -d. -f1)
+    # Initial calculation based on percentage
+    RAW_MYSQL_MB=$(echo "$TOTAL_RAM_MB * $MYSQL_ALLOC_PCT" | bc | cut -d. -f1)
+
+    # NEW LOGIC: Floor to nearest 1GB if over 1GB to prevent MySQL "Rounding Up" to 2GB
+    if [ "$RAW_MYSQL_MB" -gt 1024 ]; then
+        GIGS=$(echo "$RAW_MYSQL_MB / 1024" | bc)
+        MYSQL_BUFFER_POOL_MB=$(echo "$GIGS * 1024" | bc)
+    else
+        MYSQL_BUFFER_POOL_MB=$RAW_MYSQL_MB
+    fi
 else
     # Remote DB
     MYSQL_ALLOC_PCT=0.00
