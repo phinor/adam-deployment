@@ -91,6 +91,10 @@ fi
 MYSQL_LOG_FILE_MB=512
 # UPDATED: Lowered from 100 to 60 to prevent OOM
 MYSQL_MAX_CONN=60 
+MYSQL_TABLE_CACHE=400
+MYSQL_DEF_CACHE=400
+MYSQL_SORT_BUFFER="1M"
+MYSQL_JOIN_BUFFER="1M"
 
 # PHP Calculation
 RAM_FOR_PHP_MB=$(echo "$TOTAL_RAM_MB * $PHP_ALLOC_PCT" | bc | cut -d. -f1)
@@ -197,22 +201,32 @@ fi
 # 4. APPLY MODE
 # ==============================================================================
 if [ "$MODE" == "apply" ]; then
-    echo -e "${CYAN}--- Applying Configuration Changes ---${NC}"
+    echo -e "${CYAN}--- Applying Configuration Changes (v2 Surgical) ---${NC}"
     
-    # 1. Swap
+    # 1. Swap (The Airbag)
+    # Note: On some OpenVZ hosts, swapon will fail. The script handles this gracefully.
     ensure_swap
 
-    # 2. MySQL
+    # 2. MySQL (REVISED FOR OPENVZ STABILITY)
     echo -n "Configuring MySQL... "
     cat > "$MYSQL_OVERRIDE_FILE" <<EOF
 [mysqld]
-# Tuning Script - Stability Optimized
+# Tuning Script - Stability Optimized (OpenVZ Fix)
 innodb_buffer_pool_size = ${MYSQL_BUFFER_POOL_MB}M
 innodb_log_file_size = ${MYSQL_LOG_FILE_MB}M
 max_connections = ${MYSQL_MAX_CONN}
-# Disable heavy per-thread buffers to save RAM
-sort_buffer_size = 2M
-join_buffer_size = 2M
+
+# FIX: Disable Performance Schema to save ~1GB of pre-allocated RAM
+performance_schema = OFF
+
+# FIX: Lower table caches to prevent 'sp_head' and file handle bloat
+table_open_cache = ${MYSQL_TABLE_CACHE}
+table_definition_cache = ${MYSQL_DEF_CACHE}
+
+# FIX: Aggressive per-thread limits
+sort_buffer_size = ${MYSQL_SORT_BUFFER}
+join_buffer_size = ${MYSQL_JOIN_BUFFER}
+binlog_cache_size = 32K
 EOF
     echo -e "${GREEN}Done${NC}"
 
@@ -239,7 +253,10 @@ EOF
     fi
 
     # 4. Apache
-    echo -n "Configuring Apache... "
+    echo -n "Ensuring Apache is using mpm_event... "
+    a2dismod mpm_prefork &>/dev/null
+    a2enmod mpm_event &>/dev/null
+    
     if [ -f "$APACHE_MPM_FILE" ]; then
         [ ! -f "${APACHE_MPM_FILE}.original.bak" ] && cp "$APACHE_MPM_FILE" "${APACHE_MPM_FILE}.original.bak"
 
@@ -248,9 +265,11 @@ EOF
         sed -i "s/MaxSpareThreads.*/MaxSpareThreads          75/" "$APACHE_MPM_FILE"
         sed -i "s/ThreadsPerChild.*/ThreadsPerChild          ${APACHE_THREADS_CHILD}/" "$APACHE_MPM_FILE"
         sed -i "s/MaxRequestWorkers.*/MaxRequestWorkers       ${APACHE_MAX_WORKERS}/" "$APACHE_MPM_FILE"
+        # Added ListenBacklog to fix the "Connection Timeout" queue issue
+        if ! grep -q "ListenBacklog" "$APACHE_MPM_FILE"; then
+            echo "ListenBacklog 511" >> "$APACHE_MPM_FILE"
+        fi
         echo -e "${GREEN}Done${NC}"
-    else
-        echo -e "${RED}Skipped${NC}"
     fi
 
     # 5. Restart Services
