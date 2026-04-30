@@ -175,6 +175,16 @@ fi
             echo "No override directory found at $OVERRIDE_DIR (or directory is empty). Skipping override step."
         fi
 
+
+        # --- 5c. Run Database Migrations ---
+        echo "Running database migrations for all tenants..."
+        # We run this against the TMP path so if it fails, the live site is untouched
+        if php "$TMP_RELEASE_PATH/adam" schema:migrate --all-tenants; then
+            echo "Migrations completed successfully."
+        else
+            echo "Error: Database migrations failed! Continuing. This should be reported by ADAM."
+        fi
+        
         # All steps successful, now perform the atomic move.
         echo "Build successful. Moving to final destination."
         touch "$TMP_RELEASE_PATH"
@@ -196,12 +206,7 @@ fi
 
     # --- 7b. Restart queue workers for each tenant ---
     echo "Restarting queue workers..."
-    for INI_FILE in "$NEW_RELEASE_PATH"/*.ini; do
-        [ -f "$INI_FILE" ] || continue
-        SCHOOL_NAME=$(basename "$INI_FILE" .ini)
-        echo "Restarting queue worker for: $SCHOOL_NAME"
-        php "$LIVE_LINK/adam" queue:restart --config="$SCHOOL_NAME"
-    done
+    php "$LIVE_LINK/adam" queue:restart --all-tenants || echo "Warning: Queue worker restart encountered an error, but continuing deployment..."
 
     # --- 8. Clean up ---
     echo "Cleaning up old releases..."
