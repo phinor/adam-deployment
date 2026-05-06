@@ -129,7 +129,6 @@ fi
         # Add the new temp archive to the trap
         trap 'echo "Deployment failed. Cleaning up..."; rm -rf "$TMP_RELEASE_PATH"; rm -f "$TMP_ARCHIVE"; exit 1' EXIT SIGHUP SIGINT SIGTERM
 
-
         # Added --fail to curl to exit with an error on HTTP failures (like 404).
         curl -s -L --fail -o "$TMP_ARCHIVE" \
             -H "Authorization: Bearer $GH_TOKEN" \
@@ -145,6 +144,8 @@ fi
             echo "Error: The release directory is empty after extraction. Aborting."
             exit 1
         fi
+
+        echo "$LATEST_HASH" > "$TMP_RELEASE_PATH/includes/current.txt"
 
         if [ -L "$LIVE_LINK" ] && [ -d "$(readlink -f "$LIVE_LINK")" ]; then
             RESOLVED_LIVE_PATH="$(readlink -f "$LIVE_LINK")"
@@ -198,7 +199,6 @@ fi
     echo "Activating release: $LATEST_HASH"
     ln -sfn "$NEW_RELEASE_PATH" "$LIVE_LINK"
     echo "$LATEST_HASH" > "$CURRENT_VERSION_FILE"
-    echo "$LATEST_HASH" > "$NEW_RELEASE_PATH/includes/current.txt"
 
     # --- 7. Reset opcache ---
     echo "Resetting PHP OPcache for the web server..."
