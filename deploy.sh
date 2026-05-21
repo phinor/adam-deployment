@@ -200,6 +200,9 @@ fi
     ln -sfn "$NEW_RELEASE_PATH" "$LIVE_LINK"
     echo "$LATEST_HASH" > "$CURRENT_VERSION_FILE"
 
+    echo "Clearing discovery cache for all tenants..."
+    php "$LIVE_LINK/adam" cache:clear --all-tenants || echo "Warning: cache:clear failed, continuing..."
+
     # --- 7. Reset opcache ---
     echo "Resetting PHP OPcache for the web server..."
     sudo -u "$FPM_USER" /usr/local/bin/reset_opcache.sh
