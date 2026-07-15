@@ -420,8 +420,9 @@ by the web-tier swap, rollback is a service switch, not a code change.
 | 6 | Multi-tenant on one host | Fine in **classic** mode (fresh per request). *Do not enable worker mode* without the app-side reset project (see the study). |
 | 7 | File-based PHP sessions | Single-node only; used transiently for passkey/OAuth. Move to shared storage only if scaling horizontally. |
 | 8 | `systemctl` path in sudoers differs across releases | Verify with `command -v systemctl`; list both `/usr/bin` and `/bin` if unsure |
-| 9 | On-demand TLS cert-issuance abuse (§12) | Mandatory `ask` endpoint gating strictly on real-tenant existence, bound to localhost, with input validation |
+| 9 | On-demand TLS cert-issuance abuse (§12) | Mandatory central `ask` endpoint gating strictly on real-tenant existence — see `docs/tls-ask-endpoint-spec.md` for controls |
 | 10 | Bulk onboarding hits ACME rate limit (shared `*.adam.co.za`, §12) | Stagger onboarding / pre-warm certs / higher-limit ACME account |
+| 11 | Central `ask` endpoint outage blocks new-domain issuance (§12) | Run it highly available; existing cached certs are unaffected |
 
 ---
 
@@ -470,8 +471,14 @@ schools then need **no web-server change at all** — provisioning the tenant's
 hit.
 
 This is a natural fit because ADAM **already** selects the tenant from
-`HTTP_HOST` and already has a per-domain config file that is the authoritative
-"is this a real tenant?" signal.
+`HTTP_HOST`, and the fleet already has a central source of truth for which
+tenants exist.
+
+**The authorisation (`ask`) endpoint is hosted separately on the central
+management server — not inside ADAM and not on the school servers.** It is
+specified in full in a companion document,
+[`docs/tls-ask-endpoint-spec.md`](./tls-ask-endpoint-spec.md); this section only
+covers how the school-server Caddy config consumes it.
 
 ### 12.1 How it works
 
@@ -480,9 +487,10 @@ This is a natural fit because ADAM **already** selects the tenant from
     email ops@adam.co.za
 
     on_demand_tls {
-        # Caddy calls this before issuing a cert for an unknown host.
-        # It MUST authorise only real tenants, or you invite cert-issuance abuse.
-        ask http://127.0.0.1:9111/tls-check
+        # Central authoriser on the management server. Caddy appends `&domain=`.
+        # See docs/tls-ask-endpoint-spec.md. It MUST authorise only real tenants,
+        # or you invite cert-issuance abuse.
+        ask https://mgmt.adam.co.za/v1/tls-authorize?token={$TLS_ASK_TOKEN}
     }
 
     frankenphp {
@@ -501,45 +509,50 @@ https:// {
 }
 ```
 
+`TLS_ASK_TOKEN` is a fleet-wide shared secret injected via the systemd unit's
+environment (Caddy cannot add auth headers to the `ask` request — see the spec
+for why the token rides in the URL, plus the stronger source-IP/mTLS controls).
+
 Request flow for a brand-new domain:
 1. Client connects over TLS for `newschool.adam.co.za`.
-2. Caddy has no cert → calls the **ask** endpoint
-   `GET http://127.0.0.1:9111/tls-check?domain=newschool.adam.co.za`.
-3. The endpoint returns **200** iff that domain is a provisioned tenant → Caddy
-   obtains a Let's Encrypt cert (first request blocks a few seconds), caches it,
-   and serves. Any other domain gets a non-2xx and **no cert is issued**.
+2. Caddy has no cert → calls the **central** ask endpoint
+   `GET https://mgmt.adam.co.za/v1/tls-authorize?token=…&domain=newschool.adam.co.za`.
+3. The endpoint returns **200** iff that domain is a registered, active tenant →
+   Caddy obtains a Let's Encrypt cert (first request blocks a few seconds), caches
+   it, and serves. Any other domain gets a non-2xx and **no cert is issued**.
 
-### 12.2 The `ask` (authorisation) endpoint — mandatory
+### 12.2 The `ask` (authorisation) endpoint — centralised, mandatory
 
-Without a strict `ask` endpoint, anyone who points DNS at the server can force
-Caddy to attempt certificate issuance for arbitrary names and burn your ACME rate
-limit. The endpoint must answer "**is `domain` a real ADAM tenant on this
-server?**" and nothing else.
+Without a strict `ask` endpoint, anyone who points DNS at a school server can
+force Caddy to attempt certificate issuance for arbitrary names and burn your ACME
+rate limit. The endpoint must answer "**is `domain` a real, active ADAM
+tenant?**" and nothing else.
 
-Recommended implementation, reusing ADAM's existing "handle before bootstrap"
-pattern (`includes/handle_*.php`): a **tiny, dependency-free check** that stats the
-tenant config file, e.g. returns 200 if `config.<domain>.ini` exists in the live
-release (optionally also confirming the tenant is active in the DB). Serve it on a
-**localhost-only** listener so it is never reachable externally:
+It lives on the **central management server** because that is where the fleet's
+tenant registry and onboarding/offboarding already live, and it keeps the concern
+out of both ADAM and the school servers. The full contract — request/response
+shape, the tenant-registry source of truth, the mandatory security controls (it
+is network-exposed, not localhost), availability/failure modes, and a reference
+implementation — is in
+[`docs/tls-ask-endpoint-spec.md`](./tls-ask-endpoint-spec.md). Key points the
+school-server side depends on:
 
-- Add a small HTTP-only server block bound to `127.0.0.1:9111` in the Caddyfile
-  that routes `/tls-check` to a minimal PHP script (or an early short-circuit in
-  `public/index.php`, before the heavy bootstrap, keyed on the `?domain=` param).
-- The check should be **cheap** (a `file_exists()` on
-  `/var/www/adam/live/config.$domain.ini`) — it runs on every first-seen host.
-- Normalise/validate the `domain` parameter (lowercase, strip port, reject
-  anything not matching a hostname pattern) before touching the filesystem.
+- Onboarding must **register the tenant's domain(s) centrally before the first
+  request**, so the first HTTPS hit authorises; offboarding removes them.
+- The endpoint must be **highly available and fast** — it sits in the TLS
+  issuance path for first-seen domains (see the spec's failure-mode analysis).
 
 ### 12.3 Impact on the deployment scripts
 
 - **`new_school.sh`** no longer writes a Caddy site file, runs `certbot`, or
-  reloads the web server. Its Step 7/8 collapse to: "ensure DNS points here; the
-  first request provisions TLS automatically." Everything else (DB, dirs,
-  `config.$domain.ini`, cron line) is unchanged. **Removing a school** likewise
-  no longer needs a web-server change — deleting the config makes the ask
-  endpoint stop authorising it.
-- **`install_web.sh`** installs the single catch-all Caddyfile above instead of
-  the `import sites/*.caddy` model, plus the localhost ask-endpoint block.
+  reloads the web server. Its Step 7/8 collapse to: "**register the domain in the
+  central registry**, ensure DNS points here; the first request provisions TLS
+  automatically." Everything else (DB, dirs, `config.$domain.ini`, cron line) is
+  unchanged. **Removing a school** deregisters it centrally (Caddy then stops
+  renewing and the cert lapses) — again no web-server change.
+- **`install_web.sh`** installs the single catch-all Caddyfile above (pointing at
+  the central `ask` URL, with `TLS_ASK_TOKEN` in the unit environment) instead of
+  the `import sites/*.caddy` model.
 - **`deploy.sh`** no longer needs the reload-for-new-site rationale from §6 (there
   are no per-site files to pick up), though the opcache-correctness argument
   (validate_timestamps + unique realpaths) still stands.
@@ -556,14 +569,17 @@ release (optionally also confirming the tenant is active in the DB). Serve it on
   share the pool.
 - **First-request latency** for a never-seen domain is a few seconds while the
   cert issues; subsequent requests are normal. Acceptable for onboarding.
+- **New runtime dependency on the management server.** Every school server's TLS
+  path for *first-seen* domains now depends on the central `ask` endpoint. If it
+  is down, existing (cached) certs keep serving but new domains cannot be issued —
+  hence the high-availability requirement in the spec.
 - **Cert storage must persist** across restarts — the systemd unit's
   `StateDirectory`/`XDG_DATA_HOME` already covers this. If you ever run **multiple
   servers** for the same tenant set, point Caddy at a **shared storage backend**
   (e.g. a clustered storage module) so they don't each re-issue and so certs
   survive a node swap.
-- **The ask endpoint is security-critical.** Bind it to localhost, validate
-  input, and gate strictly on real-tenant existence. Treat a permissive
-  `tls-check` as a production incident.
+- **The ask endpoint is security-critical.** See the spec for the required
+  controls; treat a permissive `tls-authorize` as a production incident.
 - Still **classic mode** — on-demand TLS is orthogonal to worker mode and does not
   change the per-request execution model (see §14).
 
