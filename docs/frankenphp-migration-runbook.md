@@ -52,9 +52,12 @@ ADAM's `composer.json` requires a broad set of PHP extensions:
 `calendar, curl, dom, exif, fileinfo, ftp, gd, iconv, imap, json, ldap, libxml,
 mbstring, mysqli, openssl, pdo, simplexml, sodium, zip, zlib, zend-opcache`.
 
-The **default FrankenPHP static binary does not bundle `ldap` or `imap`** (ADAM
-uses LDAP for authentication and IMAP for mail). Running on a build that lacks
-them will break login and messaging in ways that unit tests will not catch.
+The **default FrankenPHP static binary does not bundle `ldap` or `imap`**. In
+ADAM both extensions are used **only by optional authentication backends** —
+`ldap`/`ad` (directory login) via `ext-ldap`, and `pop3` (mail-server login) via
+`ext-imap`. Nothing in ADAM's data, reporting, messaging, or PDF core touches
+them. Running on a build that lacks them silently breaks those login methods
+(not the whole app), in ways unit tests will not catch.
 
 **Resolve before anything else, by one of:**
 
@@ -64,6 +67,11 @@ them will break login and messaging in ways that unit tests will not catch.
 - **(b) Link FrankenPHP against the system's ZTS PHP** so it loads the same
   extension `.so` files already installed for the CLI. This keeps **one** set of
   extensions for both web and CLI and is the least surprising long-term.
+- **(c) Eliminate the dependency** — because `ldap`/`imap` are confined to a
+  couple of auth backends, they can be replaced with pure-PHP libraries (or the
+  backends retired), letting you ship the **stock** FrankenPHP binary with no
+  custom build. See **§13** for the full feasibility analysis. This is a larger
+  change than (a)/(b) but removes the constraint permanently.
 
 **Acceptance check (run on the built binary before deploying it anywhere):**
 
@@ -268,6 +276,10 @@ Key differences from the Apache block:
 - `apache2ctl configtest` → `frankenphp validate`; `service apache2 reload` →
   `systemctl reload frankenphp`.
 
+> This is the **static** per-school model (one Caddy site file per domain). For a
+> fleet moving toward many/dynamic tenants, **§12** describes an on-demand-TLS
+> alternative where `new_school.sh` writes **no** web-server config at all.
+
 ---
 
 ## 6. Changes to `deploy.sh` (release activation)
@@ -408,6 +420,8 @@ by the web-tier swap, rollback is a service switch, not a code change.
 | 6 | Multi-tenant on one host | Fine in **classic** mode (fresh per request). *Do not enable worker mode* without the app-side reset project (see the study). |
 | 7 | File-based PHP sessions | Single-node only; used transiently for passkey/OAuth. Move to shared storage only if scaling horizontally. |
 | 8 | `systemctl` path in sudoers differs across releases | Verify with `command -v systemctl`; list both `/usr/bin` and `/bin` if unsure |
+| 9 | On-demand TLS cert-issuance abuse (§12) | Mandatory `ask` endpoint gating strictly on real-tenant existence, bound to localhost, with input validation |
+| 10 | Bulk onboarding hits ACME rate limit (shared `*.adam.co.za`, §12) | Stagger onboarding / pre-warm certs / higher-limit ACME account |
 
 ---
 
@@ -440,7 +454,205 @@ curl -I https://<domain>/vDEADBEEF/theme/<asset>.css  # resolves via handle_stat
 
 ---
 
-## 12. What this runbook intentionally excludes
+## 12. Optional evolution: dynamic multi-tenant hosting (on-demand TLS)
+
+Sections 5 and 9 describe the *static* model that mirrors today's setup: each
+school gets a Caddy site file (`/etc/frankenphp/sites/<domain>.caddy`) written by
+`new_school.sh`, and Caddy provisions that domain's certificate. This works, but
+it still requires a web-server config write + reload per school.
+
+Caddy supports a **fully dynamic** alternative — **On-Demand TLS** — that fits
+ADAM's multi-tenant model almost exactly. Instead of one site block per domain,
+you run a **single catch-all site** that obtains each domain's certificate
+**lazily, on the first HTTPS request**, gated by an authorisation endpoint. New
+schools then need **no web-server change at all** — provisioning the tenant's
+`config.<domain>.ini` (and DNS) is sufficient, and the site "just works" on first
+hit.
+
+This is a natural fit because ADAM **already** selects the tenant from
+`HTTP_HOST` and already has a per-domain config file that is the authoritative
+"is this a real tenant?" signal.
+
+### 12.1 How it works
+
+```caddyfile
+{
+    email ops@adam.co.za
+
+    on_demand_tls {
+        # Caddy calls this before issuing a cert for an unknown host.
+        # It MUST authorise only real tenants, or you invite cert-issuance abuse.
+        ask http://127.0.0.1:9111/tls-check
+    }
+
+    frankenphp {
+        num_threads {$FRANKENPHP_NUM_THREADS:16}
+    }
+}
+
+# Single catch-all site for every tenant domain.
+https:// {
+    tls {
+        on_demand
+    }
+    root * /var/www/adam/live/public
+    encode zstd gzip
+    php_server
+}
+```
+
+Request flow for a brand-new domain:
+1. Client connects over TLS for `newschool.adam.co.za`.
+2. Caddy has no cert → calls the **ask** endpoint
+   `GET http://127.0.0.1:9111/tls-check?domain=newschool.adam.co.za`.
+3. The endpoint returns **200** iff that domain is a provisioned tenant → Caddy
+   obtains a Let's Encrypt cert (first request blocks a few seconds), caches it,
+   and serves. Any other domain gets a non-2xx and **no cert is issued**.
+
+### 12.2 The `ask` (authorisation) endpoint — mandatory
+
+Without a strict `ask` endpoint, anyone who points DNS at the server can force
+Caddy to attempt certificate issuance for arbitrary names and burn your ACME rate
+limit. The endpoint must answer "**is `domain` a real ADAM tenant on this
+server?**" and nothing else.
+
+Recommended implementation, reusing ADAM's existing "handle before bootstrap"
+pattern (`includes/handle_*.php`): a **tiny, dependency-free check** that stats the
+tenant config file, e.g. returns 200 if `config.<domain>.ini` exists in the live
+release (optionally also confirming the tenant is active in the DB). Serve it on a
+**localhost-only** listener so it is never reachable externally:
+
+- Add a small HTTP-only server block bound to `127.0.0.1:9111` in the Caddyfile
+  that routes `/tls-check` to a minimal PHP script (or an early short-circuit in
+  `public/index.php`, before the heavy bootstrap, keyed on the `?domain=` param).
+- The check should be **cheap** (a `file_exists()` on
+  `/var/www/adam/live/config.$domain.ini`) — it runs on every first-seen host.
+- Normalise/validate the `domain` parameter (lowercase, strip port, reject
+  anything not matching a hostname pattern) before touching the filesystem.
+
+### 12.3 Impact on the deployment scripts
+
+- **`new_school.sh`** no longer writes a Caddy site file, runs `certbot`, or
+  reloads the web server. Its Step 7/8 collapse to: "ensure DNS points here; the
+  first request provisions TLS automatically." Everything else (DB, dirs,
+  `config.$domain.ini`, cron line) is unchanged. **Removing a school** likewise
+  no longer needs a web-server change — deleting the config makes the ask
+  endpoint stop authorising it.
+- **`install_web.sh`** installs the single catch-all Caddyfile above instead of
+  the `import sites/*.caddy` model, plus the localhost ask-endpoint block.
+- **`deploy.sh`** no longer needs the reload-for-new-site rationale from §6 (there
+  are no per-site files to pick up), though the opcache-correctness argument
+  (validate_timestamps + unique realpaths) still stands.
+
+### 12.4 Caveats
+
+- **ACME rate limits are per registered domain.** All `*.adam.co.za` subdomains
+  count against the same Let's Encrypt limit (~50 certs/week for the registered
+  domain). On-demand issuance is fine at steady state, but a **bulk onboarding**
+  of many `*.adam.co.za` schools at once could hit it. Mitigations: stagger
+  onboarding, pre-warm certs (issue ahead of go-live by making one authorised
+  request per new domain), or use a higher-limit ACME account. Custom vanity
+  domains (`portal.myschool.co.za`) are separate registered domains and don't
+  share the pool.
+- **First-request latency** for a never-seen domain is a few seconds while the
+  cert issues; subsequent requests are normal. Acceptable for onboarding.
+- **Cert storage must persist** across restarts — the systemd unit's
+  `StateDirectory`/`XDG_DATA_HOME` already covers this. If you ever run **multiple
+  servers** for the same tenant set, point Caddy at a **shared storage backend**
+  (e.g. a clustered storage module) so they don't each re-issue and so certs
+  survive a node swap.
+- **The ask endpoint is security-critical.** Bind it to localhost, validate
+  input, and gate strictly on real-tenant existence. Treat a permissive
+  `tls-check` as a production incident.
+- Still **classic mode** — on-demand TLS is orthogonal to worker mode and does not
+  change the per-request execution model (see §14).
+
+**When to adopt:** if the fleet is moving toward many tenants per host, or you
+want school onboarding to be a pure data operation (no server touch), this is the
+target architecture. If you stay at a small, static set of domains per server,
+the §5 per-site model is simpler and equally correct — adopt on-demand TLS when
+the dynamic-provisioning benefit outweighs the added ask-endpoint surface.
+
+---
+
+## 13. Optional: eliminate the `ldap`/`imap` extension dependency
+
+The §2 extension gate exists because `ext-ldap` and `ext-imap` are missing from
+the stock FrankenPHP binary. Both dependencies are **small, isolated, and
+optional**, so a third path (§2 option **c**) is to remove them entirely and ship
+the **stock** binary. This is also worthwhile on its own merits, independent of
+FrankenPHP.
+
+### 13.1 Exactly where the dependencies live
+
+Both extensions are used **only by pluggable authentication backends**, selected
+per user by login type in
+`classes/ADAM/Security/Authentication/LoginModule::getLoginObject()`
+(`ad` / `ldap` / `pop3` / `pass`). The `pass` (internal password), passkey, and
+OAuth login paths use **neither** extension.
+
+| Extension | Used by | Files | Config keys |
+|---|---|---|---|
+| `ext-imap` | `pop3` backend | `Pop3.php` → `Support/MailFetcher.php` (sole caller of `MailFetcher`) | `POP3Server`, `POP3ServerPort`, `pop3serverssl`, `pop3servertls`, `pop3suffix` |
+| `ext-ldap` | `ldap` backend | `Authentication/Ldap.php` (direct `ldap_*`) | `auth_ldapserver`, `auth_ldapbasedn`, `auth_ldapprotocol`, `auth_ldapport`, `auth_ldapuserattribute`, `auth_ldapbinduser`, `auth_ldapbindpass`, `auth_ldapprotocolversion` |
+| `ext-ldap` | `ad` backend | `Authentication/Ad.php` → bundled `lib/adLDAP.php` (75 `ldap_*` calls) | `auth_adcontroller`, `auth_adaccsuf`, `auth_adsecure` |
+
+### 13.2 `ext-imap` — low effort
+
+`MailFetcher` still carries old mail-*reading* methods (`getBody`, `deleteMail`,
+`mailCount`, …), but the **only live usage** is `connect()` + `close()` from the
+`Pop3` backend — i.e. pure **credential verification** ("can this user bind to the
+mail server?"). Nothing reads mailbox contents.
+
+- **Replace** with a pure-PHP IMAP/POP3 client (e.g. `webklex/php-imap`,
+  socket-based, no `ext-imap`), or — since only a login check is needed — a small
+  raw-socket POP3/IMAP `LOGIN` over `stream_socket_client()` with TLS. Delete the
+  dead reading methods.
+- **Extra motivation:** `ext-imap` binds to the UW **c-client** library, which has
+  been unmaintained for years and is increasingly awkward to package — it is
+  widely treated as legacy regardless of this migration.
+- **Effort: Low.** One class, one caller.
+
+### 13.3 `ext-ldap` — medium effort
+
+- **Replace** both the direct `Ldap.php` calls and the bundled `adLDAP` library
+  with **`FreeDSx/LDAP`** — a **pure-PHP** LDAP protocol implementation (no
+  `ext-ldap`; supports simple bind, search, LDAPS/StartTLS). *(Symfony's Ldap
+  component is not an option — it wraps `ext-ldap`.)*
+- `Ldap.php`'s connect → bind → search → rebind-as-user flow maps directly onto
+  FreeDSx. `Ad.php`'s only real operation is "bind as `user@suffix`", so it too
+  becomes a thin FreeDSx bind — which lets you **retire the entire
+  `lib/adLDAP.php`** legacy library (a nice simplification bonus).
+- **Risk lives in testing, not code:** LDAPS/StartTLS + certificate leniency (the
+  current code uses `novalidate-cert`-style behaviour), referrals, and AD quirks
+  must be validated against a real directory per school.
+- **Effort: Medium.**
+
+### 13.4 The decision input you need first
+
+**How many tenants actually use `ad` / `ldap` / `pop3`?** That is per-tenant DB
+settings, not visible in the repo, and it sets the strategy:
+
+- **Few/none** → cheapest path is to **deprecate and remove** those backends (a
+  product decision); no replacement code, just drop the modules and the
+  `getLoginObject()` cases. `pass`/passkey/OAuth remain.
+- **Some rely on them** → reimplement with `FreeDSx` (LDAP/AD) and
+  `webklex/php-imap` or a tiny socket client (POP3), preserving functionality
+  while dropping both extensions.
+
+### 13.5 Recommendation
+
+Because the surface is tiny and fully contained in the auth layer, this is very
+feasible and attractive: it removes the §2 gate (ship the stock binary), retires
+the unmaintained c-client dependency, and lets you delete the old adLDAP library.
+A sensible sequence: do the **`ext-imap` removal early** (low effort, clear legacy
+win), and schedule the **`ext-ldap` → FreeDSx** work once the tenant-usage numbers
+are known. Until then, §2 options (a)/(b) keep everything working, so this is an
+*optimisation*, not a blocker.
+
+---
+
+## 14. What this runbook intentionally excludes
 
 **Worker mode.** FrankenPHP worker mode (persistent PHP process across requests)
 is a separate, larger project with application-code prerequisites — resettable
