@@ -52,7 +52,7 @@ else
     adduser --disabled-password --gecos "" "$username" >> "$LOGFILE" 2>&1
     echo "Set password for $username:"
     passwd "$username"
-    usermod -aG sudo "$username"
+    usermod -aG sudo,www-data "$username"
 fi
 
 # 5. SSH Configuration
