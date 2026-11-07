@@ -48,6 +48,8 @@ CURRENT_VERSION_FILE="$APP_BASE_DIR/current.txt"
 MANUAL_LOCK_FILE="$APP_BASE_DIR/deploy.lock"
 # This file is used by flock to prevent simultaneous (race condition) runs
 AUTO_LOCK_FILE="$APP_BASE_DIR/deploy.mutex"
+# Set to 1 once every release carries a secrets.ini asset, to refuse releases without one
+REQUIRE_SECRETS=0
 
 # --- 1. Check for Deployment Lock ---
 # This file is created by an admin to manually pause all deployments.
@@ -154,6 +156,9 @@ fi
         else
             echo "No previous live release found to copy .ini files from. Skipping."
         fi
+
+        echo "Fetching shared secrets..."
+        echo "$LATEST_RELEASE_INFO" | GH_TOKEN="$GH_TOKEN" REQUIRE_SECRETS="$REQUIRE_SECRETS" bash "$SCRIPT_DIR/fetch-secrets.sh" "$TMP_RELEASE_PATH"
 
         echo "Running composer install..."
         if (cd "$TMP_RELEASE_PATH" && composer install --no-dev --optimize-autoloader --no-progress); then
