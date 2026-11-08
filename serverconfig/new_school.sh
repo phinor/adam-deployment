@@ -92,6 +92,21 @@ fi
 # 2. Domain Name
 read -p "Enter the full domain name (e.g. school.adam.co.za): " domain
 
+# 2b. Cloudflare custom origin name
+# A school on its own domain (a Cloudflare for SaaS custom hostname) reaches this server through
+# the custom origin set on that hostname. Cloudflare connects with the ORIGIN name as the TLS name
+# (SNI) and the school's domain as the Host header, so Apache must answer to both in one site, and
+# the certificate must carry both. Without that, Cloudflare reports error 526.
+echo
+echo "If '$domain' is a Cloudflare custom hostname, enter the custom origin server set on it in"
+echo "Cloudflare (e.g. saints.school.adam.co.za). Leave blank for an ordinary *.adam.co.za school."
+read -p "Cloudflare custom origin name [none]: " origin_name
+origin_name=$(echo "$origin_name" | tr -d '[:space:]')
+
+if [[ -n "$origin_name" && "$origin_name" == "$domain" ]]; then
+    error_exit "The custom origin name must differ from the domain name."
+fi
+
 # --- SAFETY CHECK 2: CONFIG FILES ---
 if [[ -f "$BASE_APP_DIR/config.$domain.ini" ]]; then
     error_exit "Configuration file '$BASE_APP_DIR/config.$domain.ini' ALREADY EXISTS.\n       Aborting to prevent overwriting an active site configuration."
@@ -219,22 +234,20 @@ mv "$temp_config" "$BASE_APP_DIR/config.$domain.ini"
 chown "${REAL_USER}:www-data" "$BASE_APP_DIR/config.$domain.ini"
 chmod 644 "$BASE_APP_DIR/config.$domain.ini"
 
-# --- Step 6: Cron Job Setup ---
-log "Updating Crontab..."
-current_cron=$(crontab -l -u www-data 2>/dev/null || true)
-new_cron=$(echo "$current_cron" | grep -v -e "--config=$domain")
-new_cron_entry="* * * * * php $BASE_APP_DIR/cron.php --config=$domain > /dev/null 2>&1"
-
-echo "$new_cron
-$new_cron_entry" | crontab -u www-data -
-
-# --- Step 7: Apache Configuration ---
+# --- Step 6: Apache Configuration ---
 log "Configuring Apache..."
 apache_conf="$APACHE_AVAIL_DIR/$domain.conf"
+
+# Certbot copies this alias into the HTTPS site it creates.
+server_alias_line=""
+if [[ -n "$origin_name" ]]; then
+    server_alias_line="ServerAlias $origin_name"
+fi
 
 cat << EOF > "$apache_conf"
 <VirtualHost *:80>
     ServerName $domain
+    $server_alias_line
     DocumentRoot "$BASE_APP_DIR"
     <Directory "$BASE_APP_DIR">
         Options FollowSymLinks
@@ -258,9 +271,82 @@ else
     exit 1
 fi
 
-# --- Step 8: Certbot ---
+# --- Step 7: Certbot ---
+certbot_domains=(-d "$domain")
+if [[ -n "$origin_name" ]]; then
+    certbot_domains+=(-d "$origin_name")
+
+    echo
+    echo "================================================================="
+    echo -e "${YELLOW} ACTION REQUIRED: CLOUDFLARE, BEFORE THE CERTIFICATE ${NC}"
+    echo "================================================================="
+    echo "Let's Encrypt checks '$origin_name' through Cloudflare. While this server has"
+    echo "no certificate for it, Cloudflare answers that check with error 526."
+    echo
+    echo "In the adam.co.za zone, add a temporary Configuration Rule:"
+    echo "    When: http.host eq \"$origin_name\""
+    echo "    Then: SSL = Full"
+    echo "Delete the rule once this script has finished."
+    echo "-----------------------------------------------------------------"
+    read -p "Press [Enter] once the rule is in place..."
+fi
+
 log "Running Certbot..."
-certbot --apache -d "$domain"
+certbot --apache --cert-name "$domain" "${certbot_domains[@]}"
+
+# --- Step 8: Web installer, then cron ---
+# Cron must not start until the database is installed and fully migrated. Against an empty
+# database it fails every minute; against a half-installed one (the web installer takes minutes)
+# every job reports missing tables to BugSnag. The school's details are captured by the web
+# installer, so cron waits for that too.
+cron_entry="* * * * * php $BASE_APP_DIR/cron.php --config=$domain > /dev/null 2>&1"
+
+install_cron() {
+    log "Updating Crontab..."
+    local current_cron new_cron
+    current_cron=$(crontab -l -u www-data 2>/dev/null || true)
+    new_cron=$(echo "$current_cron" | grep -v -e "--config=$domain" || true)
+
+    echo "$new_cron
+$cron_entry" | crontab -u www-data -
+    log "Cron installed for $domain."
+}
+
+# Run as www-data: ADAM writes caches into the school's temp directory, and files created
+# there by root would be unwritable for the web server afterwards.
+schema_is_current() {
+    sudo -u www-data php "$BASE_APP_DIR/adam" schema:status "--config=$domain" 2>/dev/null \
+        | grep -q "Schema is up to date"
+}
+
+echo
+echo "================================================================="
+echo -e "${YELLOW} ACTION REQUIRED: COMPLETE THE WEB INSTALLER ${NC}"
+echo "================================================================="
+echo "Open https://$domain/ and complete the installation form."
+echo "Cron is installed only once the database is installed and up to date."
+echo "-----------------------------------------------------------------"
+
+while true; do
+    read -p "Press [Enter] once the installer has finished, or type 'skip' to install cron later: " installer_answer
+
+    if [[ "$installer_answer" == "skip" ]]; then
+        echo -e "${YELLOW}Cron NOT installed. Once the web installer has finished, add this line to${NC}"
+        echo -e "${YELLOW}www-data's crontab (sudo crontab -u www-data -e):${NC}"
+        echo "    $cron_entry"
+        log "Cron skipped for $domain."
+        break
+    fi
+
+    if schema_is_current; then
+        install_cron
+        break
+    fi
+
+    echo -e "${RED}The database is not installed, or migrations are still pending.${NC}"
+    echo " 1. Has the installation form been submitted, and has it finished loading?"
+    echo " 2. Check: sudo -u www-data php $BASE_APP_DIR/adam schema:status --config=$domain"
+done
 
 echo
 echo -e "${GREEN}=================================================="
