@@ -16,7 +16,12 @@ REAL_USER="${SUDO_USER:-$(whoami)}"
 
 # --- Configuration & Constants ---
 BASE_WEB_DIR="/var/webdata"
-BASE_APP_DIR="/var/www/adam/live"
+APP_BASE_DIR="/var/www/adam"
+BASE_APP_DIR="$APP_BASE_DIR/live"
+# School configuration files live outside every release; each release holds a link to each one.
+# deploy.sh keeps the links (sync-configs.sh).
+CONFIGS_DIR="$APP_BASE_DIR/configs"
+DEPLOY_MUTEX="$APP_BASE_DIR/deploy.mutex"
 APACHE_AVAIL_DIR="/etc/apache2/sites-available"
 LOG_FILE="./adam_setup.log"
 
@@ -108,9 +113,17 @@ if [[ -n "$origin_name" && "$origin_name" == "$domain" ]]; then
 fi
 
 # --- SAFETY CHECK 2: CONFIG FILES ---
-if [[ -f "$BASE_APP_DIR/config.$domain.ini" ]]; then
-    error_exit "Configuration file '$BASE_APP_DIR/config.$domain.ini' ALREADY EXISTS.\n       Aborting to prevent overwriting an active site configuration."
+# The live release must exist: the school's configuration is linked into it, and the web installer
+# check below runs ADAM from it. deploy.sh creates it.
+if [[ ! -L "$BASE_APP_DIR" || ! -d "$BASE_APP_DIR" ]]; then
+    error_exit "'$BASE_APP_DIR' is not a link to a deployed release.\n       Run deploy.sh first."
 fi
+
+for existing in "$CONFIGS_DIR/config.$domain.ini" "$BASE_APP_DIR/config.$domain.ini"; do
+    if [[ -e "$existing" || -L "$existing" ]]; then
+        error_exit "Configuration file '$existing' ALREADY EXISTS.\n       Aborting to prevent overwriting an active site configuration."
+    fi
+done
 
 # --- SAFETY CHECK 3: APACHE ---
 if [[ -f "$APACHE_AVAIL_DIR/$domain.conf" ]]; then
@@ -195,7 +208,6 @@ fi
 log "Creating directory structure..."
 mkdir -p "$BASE_WEB_DIR/adam/$school/"{pictures,backup,docrep}
 mkdir -p "$BASE_WEB_DIR/temp/$school"
-mkdir -p "$BASE_APP_DIR"
 
 log "Setting permissions..."
 chown -R www-data:www-data "$BASE_WEB_DIR/adam/$school"
@@ -226,13 +238,49 @@ settings [ 3party_wkhtmltopdf ] = /usr/local/bin/wkhtmltopdf.sh
 settings [ 3party_wkhtmltopdf_arg ] = --zoom 1.25
 EOF
 
-# Move config safely
-mv "$temp_config" "$BASE_APP_DIR/config.$domain.ini"
+config_file="$CONFIGS_DIR/config.$domain.ini"
 
-# UPDATED: Set Owner to the actual User ($SUDO_USER), but Group to www-data.
+# The shared folder is normally created by deploy.sh. Create it the same way if it is missing:
+# owned by the deploy user (the owner of the releases folder), readable by www-data, and setgid so
+# the files in it keep the www-data group.
+if [[ ! -d "$CONFIGS_DIR" ]]; then
+    log "Creating $CONFIGS_DIR..."
+    mkdir -p "$CONFIGS_DIR"
+    chown "$(stat -c %U "$APP_BASE_DIR/releases"):www-data" "$CONFIGS_DIR"
+    chmod 2750 "$CONFIGS_DIR"
+fi
+
+# Hold the deployment lock while the file and its link are created, so a deployment that is
+# building a release cannot miss this school. The lock is only taken if deploy.sh has created it:
+# opened for reading, it is never created here (a root-owned lock file would stop deploy.sh).
+lock_held=false
+if [[ -f "$DEPLOY_MUTEX" ]]; then
+    exec 9<"$DEPLOY_MUTEX"
+    log "Waiting for any running deployment to finish..."
+    if flock -w 900 9; then
+        lock_held=true
+    else
+        echo -e "${YELLOW}Warning: a deployment is still running after 15 minutes. Continuing without the lock.${NC}"
+        log "Deployment lock not acquired; continuing."
+    fi
+fi
+
+# Move config safely
+mv "$temp_config" "$config_file"
+
+# Set Owner to the actual User ($SUDO_USER), but Group to www-data.
 # This ensures the user can edit it, and Apache can read it (via group permissions).
-chown "${REAL_USER}:www-data" "$BASE_APP_DIR/config.$domain.ini"
-chmod 644 "$BASE_APP_DIR/config.$domain.ini"
+chown "${REAL_USER}:www-data" "$config_file"
+chmod 644 "$config_file"
+
+# Link it into the live release. Later releases get their link from deploy.sh.
+ln -s "$config_file" "$BASE_APP_DIR/config.$domain.ini"
+log "Configuration written to $config_file and linked into $BASE_APP_DIR."
+
+if [[ "$lock_held" == true ]]; then
+    flock -u 9
+fi
+exec 9<&-
 
 # --- Step 6: Apache Configuration ---
 log "Configuring Apache..."
