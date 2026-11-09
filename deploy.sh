@@ -42,6 +42,9 @@ set -eo pipefail
 # --- Derived Variables ---
 RELEASES_DIR="$APP_BASE_DIR/releases"
 OVERRIDE_DIR="$APP_BASE_DIR/override"
+# School configuration files (config.ini, config.<host>.ini) live here, outside every release, and
+# are linked into each release by sync-configs.sh.
+CONFIGS_DIR="$APP_BASE_DIR/configs"
 LIVE_LINK="$APP_BASE_DIR/live"
 CURRENT_VERSION_FILE="$APP_BASE_DIR/current.txt"
 # This file is created by an admin to manually prevent all deployments
@@ -112,6 +115,11 @@ fi
     # --- 5. Prepare Release Directory ---
     NEW_RELEASE_PATH="$RELEASES_DIR/$LATEST_HASH"
 
+    RESOLVED_LIVE_PATH=""
+    if [ -L "$LIVE_LINK" ] && [ -d "$(readlink -f "$LIVE_LINK")" ]; then
+        RESOLVED_LIVE_PATH="$(readlink -f "$LIVE_LINK")"
+    fi
+
     if [ -d "$NEW_RELEASE_PATH" ]; then
         echo "Release directory for $LATEST_HASH already exists. Re-using."
     else
@@ -147,10 +155,12 @@ fi
 
         echo "$LATEST_HASH" > "$TMP_RELEASE_PATH/includes/current.txt"
 
-        if [ -L "$LIVE_LINK" ] && [ -d "$(readlink -f "$LIVE_LINK")" ]; then
-            RESOLVED_LIVE_PATH="$(readlink -f "$LIVE_LINK")"
-            echo "Copying .ini configuration files from live release..."
-            find "$RESOLVED_LIVE_PATH" -maxdepth 1 -name "*.ini" -exec cp {} "$TMP_RELEASE_PATH/" \;
+        # School configuration files are linked in from $CONFIGS_DIR below (step 5c), never copied:
+        # plain cp would turn the live release's links back into ordinary files.
+        if [ -n "$RESOLVED_LIVE_PATH" ]; then
+            echo "Copying release .ini files (other than school configurations) from live release..."
+            find "$RESOLVED_LIVE_PATH" -maxdepth 1 -name "*.ini" ! -name "config.ini" ! -name "config.*.ini" \
+                -exec cp {} "$TMP_RELEASE_PATH/" \;
         else
             echo "No previous live release found to copy .ini files from. Skipping."
         fi
@@ -176,8 +186,13 @@ fi
             echo "No override directory found at $OVERRIDE_DIR (or directory is empty). Skipping override step."
         fi
 
+        # --- 5c. Link School Configurations ---
+        # After the overrides, so an override cannot replace a link, and before the migrations,
+        # which need every school's configuration.
+        echo "Linking school configuration files from $CONFIGS_DIR..."
+        CONFIGS_GROUP="$FPM_USER" bash "$SCRIPT_DIR/sync-configs.sh" "$CONFIGS_DIR" "$TMP_RELEASE_PATH" "$RESOLVED_LIVE_PATH"
 
-        # --- 5c. Run Database Migrations ---
+        # --- 5d. Run Database Migrations ---
         echo "Running database migrations for all tenants..."
         # We run this against the TMP path so if it fails, the live site is untouched
         if php "$TMP_RELEASE_PATH/adam" schema:migrate --all-tenants; then
@@ -196,6 +211,11 @@ fi
     fi
 
     # --- 6. Activate the New Release ---
+    # Link again just before the swap. A re-used release may predate the shared folder, and a
+    # school added during the build must not be missing from the release that goes live.
+    echo "Refreshing school configuration links in $NEW_RELEASE_PATH..."
+    CONFIGS_GROUP="$FPM_USER" bash "$SCRIPT_DIR/sync-configs.sh" "$CONFIGS_DIR" "$NEW_RELEASE_PATH" "$RESOLVED_LIVE_PATH"
+
     echo "Activating release: $LATEST_HASH"
     ln -sfn "$NEW_RELEASE_PATH" "$LIVE_LINK"
     echo "$LATEST_HASH" > "$CURRENT_VERSION_FILE"
