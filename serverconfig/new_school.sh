@@ -16,7 +16,12 @@ REAL_USER="${SUDO_USER:-$(whoami)}"
 
 # --- Configuration & Constants ---
 BASE_WEB_DIR="/var/webdata"
-BASE_APP_DIR="/var/www/adam/live"
+APP_BASE_DIR="/var/www/adam"
+BASE_APP_DIR="$APP_BASE_DIR/live"
+# School configuration files live outside every release; each release holds a link to each one.
+# deploy.sh keeps the links (sync-configs.sh).
+CONFIGS_DIR="$APP_BASE_DIR/configs"
+DEPLOY_MUTEX="$APP_BASE_DIR/deploy.mutex"
 APACHE_AVAIL_DIR="/etc/apache2/sites-available"
 LOG_FILE="./adam_setup.log"
 
@@ -92,10 +97,33 @@ fi
 # 2. Domain Name
 read -p "Enter the full domain name (e.g. school.adam.co.za): " domain
 
-# --- SAFETY CHECK 2: CONFIG FILES ---
-if [[ -f "$BASE_APP_DIR/config.$domain.ini" ]]; then
-    error_exit "Configuration file '$BASE_APP_DIR/config.$domain.ini' ALREADY EXISTS.\n       Aborting to prevent overwriting an active site configuration."
+# 2b. Cloudflare custom origin name
+# A school on its own domain (a Cloudflare for SaaS custom hostname) reaches this server through
+# the custom origin set on that hostname. Cloudflare connects with the ORIGIN name as the TLS name
+# (SNI) and the school's domain as the Host header, so Apache must answer to both in one site, and
+# the certificate must carry both. Without that, Cloudflare reports error 526.
+echo
+echo "If '$domain' is a Cloudflare custom hostname, enter the custom origin server set on it in"
+echo "Cloudflare (e.g. saints.school.adam.co.za). Leave blank for an ordinary *.adam.co.za school."
+read -p "Cloudflare custom origin name [none]: " origin_name
+origin_name=$(echo "$origin_name" | tr -d '[:space:]')
+
+if [[ -n "$origin_name" && "$origin_name" == "$domain" ]]; then
+    error_exit "The custom origin name must differ from the domain name."
 fi
+
+# --- SAFETY CHECK 2: CONFIG FILES ---
+# The live release must exist: the school's configuration is linked into it, and the web installer
+# check below runs ADAM from it. deploy.sh creates it.
+if [[ ! -L "$BASE_APP_DIR" || ! -d "$BASE_APP_DIR" ]]; then
+    error_exit "'$BASE_APP_DIR' is not a link to a deployed release.\n       Run deploy.sh first."
+fi
+
+for existing in "$CONFIGS_DIR/config.$domain.ini" "$BASE_APP_DIR/config.$domain.ini"; do
+    if [[ -e "$existing" || -L "$existing" ]]; then
+        error_exit "Configuration file '$existing' ALREADY EXISTS.\n       Aborting to prevent overwriting an active site configuration."
+    fi
+done
 
 # --- SAFETY CHECK 3: APACHE ---
 if [[ -f "$APACHE_AVAIL_DIR/$domain.conf" ]]; then
@@ -180,7 +208,6 @@ fi
 log "Creating directory structure..."
 mkdir -p "$BASE_WEB_DIR/adam/$school/"{pictures,backup,docrep}
 mkdir -p "$BASE_WEB_DIR/temp/$school"
-mkdir -p "$BASE_APP_DIR"
 
 log "Setting permissions..."
 chown -R www-data:www-data "$BASE_WEB_DIR/adam/$school"
@@ -211,30 +238,64 @@ settings [ 3party_wkhtmltopdf ] = /usr/local/bin/wkhtmltopdf.sh
 settings [ 3party_wkhtmltopdf_arg ] = --zoom 1.25
 EOF
 
+config_file="$CONFIGS_DIR/config.$domain.ini"
+
+# The shared folder is normally created by deploy.sh. Create it the same way if it is missing:
+# owned by the deploy user (the owner of the releases folder), readable by www-data, and setgid so
+# the files in it keep the www-data group.
+if [[ ! -d "$CONFIGS_DIR" ]]; then
+    log "Creating $CONFIGS_DIR..."
+    mkdir -p "$CONFIGS_DIR"
+    chown "$(stat -c %U "$APP_BASE_DIR/releases"):www-data" "$CONFIGS_DIR"
+    chmod 2750 "$CONFIGS_DIR"
+fi
+
+# Hold the deployment lock while the file and its link are created, so a deployment that is
+# building a release cannot miss this school. The lock is only taken if deploy.sh has created it:
+# opened for reading, it is never created here (a root-owned lock file would stop deploy.sh).
+lock_held=false
+if [[ -f "$DEPLOY_MUTEX" ]]; then
+    exec 9<"$DEPLOY_MUTEX"
+    log "Waiting for any running deployment to finish..."
+    if flock -w 900 9; then
+        lock_held=true
+    else
+        echo -e "${YELLOW}Warning: a deployment is still running after 15 minutes. Continuing without the lock.${NC}"
+        log "Deployment lock not acquired; continuing."
+    fi
+fi
+
 # Move config safely
-mv "$temp_config" "$BASE_APP_DIR/config.$domain.ini"
+mv "$temp_config" "$config_file"
 
-# UPDATED: Set Owner to the actual User ($SUDO_USER), but Group to www-data.
+# Set Owner to the actual User ($SUDO_USER), but Group to www-data.
 # This ensures the user can edit it, and Apache can read it (via group permissions).
-chown "${REAL_USER}:www-data" "$BASE_APP_DIR/config.$domain.ini"
-chmod 644 "$BASE_APP_DIR/config.$domain.ini"
+chown "${REAL_USER}:www-data" "$config_file"
+chmod 644 "$config_file"
 
-# --- Step 6: Cron Job Setup ---
-log "Updating Crontab..."
-current_cron=$(crontab -l -u www-data 2>/dev/null || true)
-new_cron=$(echo "$current_cron" | grep -v -e "--config=$domain")
-new_cron_entry="* * * * * php $BASE_APP_DIR/cron.php --config=$domain > /dev/null 2>&1"
+# Link it into the live release. Later releases get their link from deploy.sh.
+ln -s "$config_file" "$BASE_APP_DIR/config.$domain.ini"
+log "Configuration written to $config_file and linked into $BASE_APP_DIR."
 
-echo "$new_cron
-$new_cron_entry" | crontab -u www-data -
+if [[ "$lock_held" == true ]]; then
+    flock -u 9
+fi
+exec 9<&-
 
-# --- Step 7: Apache Configuration ---
+# --- Step 6: Apache Configuration ---
 log "Configuring Apache..."
 apache_conf="$APACHE_AVAIL_DIR/$domain.conf"
+
+# Certbot copies this alias into the HTTPS site it creates.
+server_alias_line=""
+if [[ -n "$origin_name" ]]; then
+    server_alias_line="ServerAlias $origin_name"
+fi
 
 cat << EOF > "$apache_conf"
 <VirtualHost *:80>
     ServerName $domain
+    $server_alias_line
     DocumentRoot "$BASE_APP_DIR"
     <Directory "$BASE_APP_DIR">
         Options FollowSymLinks
@@ -258,9 +319,82 @@ else
     exit 1
 fi
 
-# --- Step 8: Certbot ---
+# --- Step 7: Certbot ---
+certbot_domains=(-d "$domain")
+if [[ -n "$origin_name" ]]; then
+    certbot_domains+=(-d "$origin_name")
+
+    echo
+    echo "================================================================="
+    echo -e "${YELLOW} ACTION REQUIRED: CLOUDFLARE, BEFORE THE CERTIFICATE ${NC}"
+    echo "================================================================="
+    echo "Let's Encrypt checks '$origin_name' through Cloudflare. While this server has"
+    echo "no certificate for it, Cloudflare answers that check with error 526."
+    echo
+    echo "In the adam.co.za zone, add a temporary Configuration Rule:"
+    echo "    When: http.host eq \"$origin_name\""
+    echo "    Then: SSL = Full"
+    echo "Delete the rule once this script has finished."
+    echo "-----------------------------------------------------------------"
+    read -p "Press [Enter] once the rule is in place..."
+fi
+
 log "Running Certbot..."
-certbot --apache -d "$domain"
+certbot --apache --cert-name "$domain" "${certbot_domains[@]}"
+
+# --- Step 8: Web installer, then cron ---
+# Cron must not start until the database is installed and fully migrated. Against an empty
+# database it fails every minute; against a half-installed one (the web installer takes minutes)
+# every job reports missing tables to BugSnag. The school's details are captured by the web
+# installer, so cron waits for that too.
+cron_entry="* * * * * php $BASE_APP_DIR/cron.php --config=$domain > /dev/null 2>&1"
+
+install_cron() {
+    log "Updating Crontab..."
+    local current_cron new_cron
+    current_cron=$(crontab -l -u www-data 2>/dev/null || true)
+    new_cron=$(echo "$current_cron" | grep -v -e "--config=$domain" || true)
+
+    echo "$new_cron
+$cron_entry" | crontab -u www-data -
+    log "Cron installed for $domain."
+}
+
+# Run as www-data: ADAM writes caches into the school's temp directory, and files created
+# there by root would be unwritable for the web server afterwards.
+schema_is_current() {
+    sudo -u www-data php "$BASE_APP_DIR/adam" schema:status "--config=$domain" 2>/dev/null \
+        | grep -q "Schema is up to date"
+}
+
+echo
+echo "================================================================="
+echo -e "${YELLOW} ACTION REQUIRED: COMPLETE THE WEB INSTALLER ${NC}"
+echo "================================================================="
+echo "Open https://$domain/ and complete the installation form."
+echo "Cron is installed only once the database is installed and up to date."
+echo "-----------------------------------------------------------------"
+
+while true; do
+    read -p "Press [Enter] once the installer has finished, or type 'skip' to install cron later: " installer_answer
+
+    if [[ "$installer_answer" == "skip" ]]; then
+        echo -e "${YELLOW}Cron NOT installed. Once the web installer has finished, add this line to${NC}"
+        echo -e "${YELLOW}www-data's crontab (sudo crontab -u www-data -e):${NC}"
+        echo "    $cron_entry"
+        log "Cron skipped for $domain."
+        break
+    fi
+
+    if schema_is_current; then
+        install_cron
+        break
+    fi
+
+    echo -e "${RED}The database is not installed, or migrations are still pending.${NC}"
+    echo " 1. Has the installation form been submitted, and has it finished loading?"
+    echo " 2. Check: sudo -u www-data php $BASE_APP_DIR/adam schema:status --config=$domain"
+done
 
 echo
 echo -e "${GREEN}=================================================="
